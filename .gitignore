@@ -1,0 +1,8 @@
+/upstream/
+/.deps/
+/build/
+/data/
+/results/
+/.codex/agent-worklogs/
+__pycache__/
+*.pyc

@@ -1,0 +1,10 @@
+{
+  "TLI": {
+    "url": "https://github.com/curtis-sun/TLI.git",
+    "commit": "13224d31d2dcb8ad4481529154c4c286cf4c32fc"
+  },
+  "GRE": {
+    "url": "https://github.com/gre4index/GRE.git",
+    "commit": "e807edcef51df6732f07f94d4c797fb3897519ba"
+  }
+}
