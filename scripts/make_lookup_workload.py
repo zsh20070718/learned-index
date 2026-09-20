@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate reproducible TLI string point lookups with misses and hot-set access."""
 import argparse
+import bisect
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -31,6 +32,28 @@ def bounded_decimal(value):
 def ratio_argument(value):
     try:
         return bounded_decimal(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def bounded_zipf_exponent(value):
+    try:
+        exponent = Decimal(str(value))
+    except InvalidOperation as error:
+        raise ValueError("zipf_exponent must be a decimal number") from error
+    if not exponent.is_finite():
+        raise ValueError("zipf_exponent must be finite")
+    parts = exponent.as_tuple()
+    if len(parts.digits) > 128 or abs(parts.exponent) > 256:
+        raise ValueError("zipf_exponent precision limit: 128 digits and absolute exponent <= 256")
+    if not 0 <= exponent <= 3:
+        raise ValueError("zipf_exponent must be in [0, 3]")
+    return exponent
+
+
+def zipf_exponent_argument(value):
+    try:
+        return bounded_zipf_exponent(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
 
@@ -90,7 +113,8 @@ def missing_key(source_key, key_set, rng):
 
 
 def generate(data_path, operations, miss_ratio=0.0, distribution="uniform",
-             hotset_fraction=0.1, hot_probability=0.9, seed=42):
+             hotset_fraction=0.1, hot_probability=0.9, seed=42,
+             zipf_exponent=1.1):
     if not data_path.name.endswith("_string"):
         raise ValueError("Dataset filename must end in _string")
     if not 1 <= operations <= MAX_ITEMS:
@@ -98,13 +122,14 @@ def generate(data_path, operations, miss_ratio=0.0, distribution="uniform",
     miss_ratio = bounded_decimal(miss_ratio)
     hotset_fraction = bounded_decimal(hotset_fraction)
     hot_probability = bounded_decimal(hot_probability)
+    zipf_exponent = bounded_zipf_exponent(zipf_exponent)
     for name, ratio in (("miss_ratio", miss_ratio), ("hot_probability", hot_probability)):
         if not 0 <= ratio <= 1:
             raise ValueError(f"{name} must be in [0, 1]")
     if not 0 < hotset_fraction < 1:
         raise ValueError("hotset_fraction must be in (0, 1)")
-    if distribution not in ("uniform", "hotspot"):
-        raise ValueError("distribution must be uniform or hotspot")
+    if distribution not in ("uniform", "hotspot", "zipf"):
+        raise ValueError("distribution must be uniform, hotspot or zipf")
     keys = read_keys(data_path)
     if distribution == "hotspot" and len(keys) < 2:
         raise ValueError("Hotspot distribution requires at least two keys")
@@ -117,7 +142,11 @@ def generate(data_path, operations, miss_ratio=0.0, distribution="uniform",
         max_query_bytes = min(MAX_KEY_BYTES, max_query_bytes + 22)
     if 8 + operations * (17 + max_query_bytes) > MAX_WORKLOAD_BYTES:
         raise ValueError("Workload could exceed the 256 MiB local output limit; reduce operations")
-    settings = f"{distribution}_s{seed}"
+    if distribution == "zipf":
+        exponent_label = format(zipf_exponent.normalize(), "g").lower()
+        settings = f"zipf_ze{exponent_label}_rankbytes_s{seed}"
+    else:
+        settings = f"{distribution}_s{seed}"
     if distribution == "hotspot":
         settings += f"_hf{hotset_fraction:g}_hp{hot_probability:g}"
     # The fractional nl field is informational; authoritative exact counts are
@@ -136,16 +165,26 @@ def generate(data_path, operations, miss_ratio=0.0, distribution="uniform",
     cached_misses = {}
     unique_hits, unique_misses = set(), set()
     hot_sources = hit_hot_sources = miss_hot_sources = 0
+    zipf_cdf = None
+    if distribution == "zipf" and zipf_exponent:
+        cumulative = 0.0
+        zipf_cdf = []
+        exponent = float(zipf_exponent)
+        for rank in range(1, len(keys) + 1):
+            cumulative += rank ** -exponent
+            zipf_cdf.append(cumulative)
     with output.open("xb") as out:
         try:
             out.write(struct.pack("<Q", operations))
             for operation in range(operations):
-                if distribution == "uniform":
+                if distribution == "uniform" or (distribution == "zipf" and not zipf_exponent):
                     offset = source_rng.randrange(len(keys))
-                elif source_rng.random() < hot_probability:
+                elif distribution == "hotspot" and source_rng.random() < hot_probability:
                     offset = source_rng.randrange(hot_count)
-                else:
+                elif distribution == "hotspot":
                     offset = source_rng.randrange(hot_count, len(keys))
+                else:
+                    offset = bisect.bisect(zipf_cdf, source_rng.random() * zipf_cdf[-1])
                 hot_sources += offset < hot_count
                 if operation in negatives:
                     if offset not in cached_misses:
@@ -189,6 +228,13 @@ def generate(data_path, operations, miss_ratio=0.0, distribution="uniform",
             "hit_source_count": hit_hot_sources, "miss_source_count": miss_hot_sources,
         },
     }
+    if distribution == "zipf":
+        metadata["zipf"] = {
+            "exponent": float(zipf_exponent),
+            "exponent_decimal": str(zipf_exponent),
+            "rank_definition": "1-based position in byte-sorted dataset order; rank 1 is the first key",
+            "probability": "rank^-exponent, normalized over ranks 1..dataset_keys",
+        }
     # Retain a completed workload if metadata creation fails; never overwrite it.
     with sidecar.open("x") as out:
         json.dump(metadata, out, indent=2)
@@ -202,14 +248,16 @@ def main():
     parser.add_argument("operations", type=int)
     parser.add_argument("--miss-ratio", type=ratio_argument, default=Decimal("0"),
                         help="Fraction of point lookups that miss; count is rounded down")
-    parser.add_argument("--distribution", choices=("uniform", "hotspot"), default="uniform")
+    parser.add_argument("--distribution", choices=("uniform", "hotspot", "zipf"), default="uniform")
     parser.add_argument("--hotset-fraction", type=ratio_argument, default=Decimal("0.1"))
     parser.add_argument("--hot-probability", type=ratio_argument, default=Decimal("0.9"))
+    parser.add_argument("--zipf-exponent", type=zipf_exponent_argument, default=Decimal("1.1"))
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     try:
         result = generate(args.data, args.operations, args.miss_ratio, args.distribution,
-                          args.hotset_fraction, args.hot_probability, args.seed)
+                          args.hotset_fraction, args.hot_probability, args.seed,
+                          args.zipf_exponent)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     print(json.dumps(result))

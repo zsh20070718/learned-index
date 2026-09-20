@@ -17,3 +17,9 @@ GRE is downloaded as reference material only:
 Boost headers are obtained from the Ubuntu development package or an existing system installation. Their original license notices remain in the local dependency directory. No dependency source, package archive, attachment or dataset is redistributed in this repository.
 
 Original setup scripts and adapter code in this repository are licensed under GPL-3.0; see LICENSE. The GPL text is copied from TLI's LICENSE.
+
+Real-data preparation follows links in TLI's bundled Wormhole documentation:
+
+- dwyl/english-words `words.txt`, pinned by commit and SHA-256 in `datasets.lock.json`. Its repository contains an Unlicense file and a README attribution to the original Infochimps source.
+- MemeTracker phrase-cluster release, hosted by Stanford: https://snap.stanford.edu/memetracker/data.html. Citation: J. Leskovec, L. Backstrom, J. Kleinberg, “Meme-tracking and the Dynamics of the News Cycle”, KDD 2009.
+- Original and derived data remain local and are not redistributed. This repository's code license does not grant rights to the source datasets. See `docs/DATASETS.md` for provenance and dataset-scope differences.

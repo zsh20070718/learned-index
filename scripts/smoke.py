@@ -6,10 +6,15 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
+import shutil
 import statistics
 import subprocess
 import sys
 import tempfile
+
+from make_lookup_workload import read_keys, sha256
+from prepare_real_datasets import describe_keys
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOADS = [
@@ -29,6 +34,8 @@ LOOKUP_WORKLOADS = [
     ("lookup_miss100", "uniform", 1.0),
     ("lookup_hotspot", "hotspot", 0.0),
     ("lookup_hotspot_miss50", "hotspot", 0.5),
+    ("lookup_zipf", "zipf", 0.0),
+    ("lookup_zipf_miss50", "zipf", 0.5),
 ]
 
 
@@ -38,6 +45,8 @@ def main():
     parser.add_argument("--keys", type=int, default=10000)
     parser.add_argument("--operations", type=int, default=2000)
     parser.add_argument("--repeats", type=int, default=1, help="Independent index builds per throughput run")
+    parser.add_argument("--dataset", type=Path, action="append", default=[],
+                        help="Prepared real _string file with JSON sidecar; repeat to add datasets alongside synthetic controls")
     args = parser.parse_args()
     if not 1000 <= args.keys <= 100000:
         parser.error("keys must be in [1000, 100000]")
@@ -49,6 +58,24 @@ def main():
     for name in ("string_benchmark", "generate"):
         if not (build / name).is_file():
             parser.error(f"Missing {name}; run scripts/setup.py first")
+    external = []
+    labels = {"random", "prefix"}
+    for path in args.dataset:
+        path = path.resolve()
+        label = path.name.removesuffix("_string")
+        if not path.name.endswith("_string") or not re.fullmatch(r"[A-Za-z0-9_-]+", label) or label in labels:
+            parser.error(f"Dataset needs a unique simple name ending in _string: {path}")
+        try:
+            keys = read_keys(path)
+            metadata = json.loads(Path(str(path) + ".json").read_text())
+            if len(keys) != args.keys or metadata["keys"] != args.keys:
+                parser.error(f"{path}: dataset must have --keys={args.keys} keys for a matched comparison")
+            if metadata["dataset_sha256"] != sha256(path) or metadata["kind"] != "real":
+                parser.error(f"{path}: metadata kind/hash mismatch")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            parser.error(f"{path}: {error}")
+        external.append((label, path, metadata))
+        labels.add(label)
     (ROOT / "results").mkdir(exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix="smoke-", dir=ROOT / "results"))
     (run_dir / "data").mkdir()
@@ -67,6 +94,7 @@ def main():
     rows = []
     samples = []
     lookup_metadata = {}
+    dataset_metadata = {}
 
     def cases(shape, data):
         for label, scan, insert, pattern in WORKLOADS:
@@ -90,11 +118,20 @@ def main():
             yield label, metadata["workload_file"]
 
     # Each index reuses the same data and operations; verification is untimed.
-    for shape in ("random", "prefix"):
+    datasets = [("random", None, None), ("prefix", None, None)] + external
+    for shape, source, metadata in datasets:
         data = f"data/smoke_{shape}_string"
-        run([sys.executable, "-B", ROOT / "scripts/make_dataset.py", data, "--shape", shape,
-             "--count", args.keys],
-            f"{shape}-dataset.log")
+        if source is None:
+            run([sys.executable, "-B", ROOT / "scripts/make_dataset.py", data, "--shape", shape,
+                 "--count", args.keys], f"{shape}-dataset.log")
+            metadata = {"kind": "synthetic", "shape": shape, "seed": 42,
+                        "keys": args.keys, "dataset_sha256": sha256(run_dir / data)}
+        else:
+            shutil.copyfile(source, run_dir / data)
+            if sha256(run_dir / data) != metadata["dataset_sha256"]:
+                raise RuntimeError(f"Dataset changed during copy: {source}")
+        metadata = {**metadata, "statistics": describe_keys(read_keys(run_dir / data))}
+        dataset_metadata[shape] = metadata
         for label, ops in cases(shape, data):
             tag = f"{shape}-{label}"
             for index in INDEXES:
@@ -133,6 +170,7 @@ def main():
         "scope": "setup smoke only; not a publication performance experiment",
         "keys_per_shape": args.keys, "operations_per_workload": args.operations, "threads": 1,
         "repeats": args.repeats, "seed": 42, "indexes": INDEXES,
+        "datasets": dataset_metadata,
         "lookup_workloads": lookup_metadata,
         "verification": "independent map oracle, insert read-back and final-key read-back; separate from timing",
         "cases": len(rows), "upstreams": json.loads((ROOT / "upstream.lock.json").read_text()),
@@ -140,7 +178,7 @@ def main():
                             for name in ("generate", "string_benchmark")},
         "inputs_sha256": {str(path.relative_to(run_dir)): hashlib.sha256(path.read_bytes()).hexdigest()
                           for path in sorted((run_dir / "data").iterdir())},
-        "limits": ["Small synthetic workloads; no CPU pinning or process isolation",
+        "limits": ["Small datasets; no CPU pinning or process isolation",
                    "Reported index bytes do not include all string storage or process RSS"],
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

@@ -35,6 +35,9 @@ set_tests_properties(benchmark_contract_checks PROPERTIES TIMEOUT 30)
 add_test(NAME lookup_workload_checks
   COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/lookup_workload_test.py")
 set_tests_properties(lookup_workload_checks PROPERTIES TIMEOUT 30)
+add_test(NAME real_dataset_checks
+  COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/real_dataset_test.py")
+set_tests_properties(real_dataset_checks PROPERTIES TIMEOUT 30)
 add_test(NAME string_benchmark_smoke
   COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/scripts/smoke.py"
     --build-dir "${CMAKE_CURRENT_BINARY_DIR}")

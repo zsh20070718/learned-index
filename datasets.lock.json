@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "sources": {
+    "english-words": {
+      "url": "https://raw.githubusercontent.com/dwyl/english-words/20f5cc9b3f0ccc8ce45d814c532b7c2031bba31c/words.txt",
+      "filename": "english-words.txt",
+      "bytes": 4862985,
+      "sha256": "39a4ead879cc8283de87f2ec58e7b4b340d6caa724db1b52a91dccf2f273c5e7",
+      "compression": "none",
+      "reference": "upstream/TLI/wormhole/README.md:63",
+      "homepage": "https://github.com/dwyl/english-words",
+      "revision": "20f5cc9b3f0ccc8ce45d814c532b7c2031bba31c",
+      "rights_note": "Repository LICENSE.md is Unlicense; README also credits the original Infochimps word list. Raw data is downloaded locally, not redistributed."
+    },
+    "memetracker-clusters": {
+      "url": "https://snap.stanford.edu/memetracker/srcdata/clust-qt08080902w3mfq5.txt.gz",
+      "filename": "memetracker-clusters.txt.gz",
+      "bytes": 230078770,
+      "sha256": "07875c309cf31551fce87c3394f271a49b925b08624260c91049c938e6205f7f",
+      "compression": "gzip",
+      "reference": "upstream/TLI/wormhole/README.md:481 -> https://github.com/wuxb45/wormhole/issues/5 -> MemeTracker data page",
+      "homepage": "https://snap.stanford.edu/memetracker/data.html",
+      "rights_note": "Source page credits Leskovec, Backstrom and Kleinberg (KDD 2009); no blanket redistribution license asserted here. Raw data is downloaded locally, not redistributed.",
+      "scope_note": "Phrase-cluster release, not the complete monthly raw corpus, Wormhole's exact m9urls snapshot, or TLI's url_90M_string."
+    }
+  },
+  "datasets": {
+    "english_words": {"source": "english-words", "format": "lines"},
+    "memetracker_urls": {"source": "memetracker-clusters", "format": "cluster_urls"},
+    "memetracker_phrases": {"source": "memetracker-clusters", "format": "cluster_phrases"}
+  }
+}

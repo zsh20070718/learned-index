@@ -10,7 +10,14 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from make_lookup_workload import generate, read_keys, fraction_count, ratio_argument, NOT_FOUND
+from make_lookup_workload import (
+    NOT_FOUND,
+    fraction_count,
+    generate,
+    ratio_argument,
+    read_keys,
+    zipf_exponent_argument,
+)
 
 
 def write_keys(path, keys):
@@ -79,6 +86,62 @@ class WorkloadTest(unittest.TestCase):
             self.assertTrue(query_key == source_key or query_key.startswith(source_key + b"~miss/"))
         self.assertGreater(hit["hotset"]["actual_source_ratio"], 0.85)
         self.assertLess(hit["hotset"]["actual_source_ratio"], 0.95)
+
+    def test_zipf_wire_reproducibility_misses_and_skew(self):
+        report = generate(self.data, 20000, 0.25, "zipf", seed=17, zipf_exponent=1.5)
+        output = Path(report["workload_file"])
+        rows = read_operations(output)
+        self.assertEqual(sum(row[1] == NOT_FOUND for row in rows), 5000)
+        source_counts = {key: 0 for key in self.keys}
+        for op, expected, key, hi in rows:
+            self.assertEqual((op, hi), (0, b""))
+            source_key = key.split(b"~miss/", 1)[0] if expected == NOT_FOUND else key
+            self.assertIn(source_key, source_counts)
+            self.assertEqual(key not in self.keys, expected == NOT_FOUND)
+            source_counts[source_key] += 1
+        top_decile = sum(source_counts[key] for key in self.keys[:20]) / len(rows)
+        self.assertGreater(top_decile, 0.75)
+        self.assertIn("_zipf_ze1.5_rankbytes_s17", output.name)
+        self.assertEqual(report["zipf"]["exponent"], 1.5)
+        self.assertIn("byte-sorted", report["zipf"]["rank_definition"])
+
+        other = Path(self.temp.name) / "zipf_copy_string"
+        write_keys(other, self.keys)
+        repeat = generate(other, 20000, 0.25, "zipf", seed=17, zipf_exponent=1.5)
+        self.assertEqual(output.read_bytes(), Path(repeat["workload_file"]).read_bytes())
+
+        hits = generate(self.data, 1000, 0, "zipf", seed=29, zipf_exponent=1.5)
+        mixed = generate(self.data, 1000, 0.5, "zipf", seed=29, zipf_exponent=1.5)
+        hit_rows = read_operations(Path(hits["workload_file"]))
+        mixed_rows = read_operations(Path(mixed["workload_file"]))
+        for hit_row, mixed_row in zip(hit_rows, mixed_rows):
+            mixed_source = mixed_row[2].split(b"~miss/", 1)[0]
+            self.assertEqual(hit_row[2], mixed_source)
+
+    def test_zipf_zero_exponent_matches_uniform(self):
+        uniform = generate(self.data, 2000, 0.3, "uniform", seed=31)
+        other = Path(self.temp.name) / "zero_zipf_string"
+        write_keys(other, self.keys)
+        zero_zipf = generate(other, 2000, 0.3, "zipf", seed=31, zipf_exponent=0)
+        self.assertEqual(
+            Path(uniform["workload_file"]).read_bytes(),
+            Path(zero_zipf["workload_file"]).read_bytes(),
+        )
+        self.assertNotIn("zipf", uniform)
+        self.assertEqual(zero_zipf["zipf"]["exponent"], 0.0)
+
+    def test_zipf_exponent_validation(self):
+        import argparse
+        for exponent in (-0.1, 3.1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                generate(self.data, 10, distribution="zipf", zipf_exponent=exponent)
+            with self.assertRaises(argparse.ArgumentTypeError):
+                zipf_exponent_argument(str(exponent))
+        self.assertEqual(zipf_exponent_argument("3"), Decimal("3"))
+        tiny = generate(
+            self.data, 10, distribution="zipf", zipf_exponent=Decimal("1e-256")
+        )
+        self.assertIn("_zipf_ze1e-256_rankbytes_", Path(tiny["workload_file"]).name)
 
     def test_decimal_ratio_boundaries(self):
         report = generate(self.data, 100, 0.29, "hotspot", 0.29, 1)
