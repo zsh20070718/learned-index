@@ -3,7 +3,15 @@
 #include "benchmark.h"
 #include "competitors/art.h"
 #include "std_map.h"
+#include "checked_index.h"
+#include "observed_index.h"
 #include "utils/cxxopts.hpp"
+
+template <class Index>
+void RunIndex(tli::Benchmark<std::string>& bench, bool verify) {
+  if (verify) bench.Run<CheckedIndex<Index>>();
+  else bench.Run<ObservedIndex<Index>>();
+}
 
 int main(int argc, char** argv) {
   try {
@@ -14,7 +22,7 @@ int main(int argc, char** argv) {
       ("ops", "TLI generated workload", cxxopts::value<std::string>())
       ("only", "ART or StdMap", cxxopts::value<std::string>()->default_value("ART"))
       ("through", "Measure throughput (run --verify separately first)")
-      ("verify", "Validate lookups and inclusive range sums")
+      ("verify", "Validate lookups, range sums, insert read-back and final keys")
       ("csv", "Append upstream-format CSV in ./results/")
       ("r,repeats", "Throughput repetitions", cxxopts::value<int>()->default_value("1"))
       ("help", "Show usage");
@@ -49,8 +57,9 @@ int main(int argc, char** argv) {
     tli::Benchmark<std::string> bench(data, ops,
       args.count("through") ? repeats : 1, args.count("through"), false, false,
       false, false, args.count("csv"), 1, args.count("verify"));
-    if (only == "ART") bench.Run<tli_art::ART<std::string>>();
-    else bench.Run<StdMap>();
+    const bool verify = args.count("verify");
+    if (only == "ART") RunIndex<tli_art::ART<std::string>>(bench, verify);
+    else RunIndex<StdMap>(bench, verify);
     return tli::run_failed ? 1 : 0;
   } catch (const std::exception& error) {
     std::cerr << "error: " << error.what() << '\n';
