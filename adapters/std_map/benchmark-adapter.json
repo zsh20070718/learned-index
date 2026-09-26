@@ -1,0 +1,8 @@
+{
+  "contract": "string-index/v1",
+  "id": "std-map",
+  "source_dir": ".",
+  "cmake_target": "std_map_adapter",
+  "factory_header": "std_map_adapter.h",
+  "factory_symbol": "make_std_map_index"
+}

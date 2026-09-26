@@ -1,12 +1,28 @@
 # 字符串学习型索引 Benchmark
 
-张圣皓负责的字符串内存索引 benchmark 工作区。以 [TLI](https://github.com/curtis-sun/TLI) 和 [GRE](https://github.com/gre4index/GRE) 为参考，先提供可复现的开发环境、小数据测试和接入入口。
+张圣皓负责的字符串内存索引 benchmark 工作区。以 [TLI](https://github.com/curtis-sun/TLI) 和 [GRE](https://github.com/gre4index/GRE) 为参考，提供可复现的开发环境、外部数据与实现的接入入口，以及小数据测试。
 
 项目定位是**数据集与字符串索引实现之间的评测层**：用户指定数据集位置和实现位置，运行统一脚本，得到详细评测结果。数据来源与实现均独立于本项目；我们负责接入、负载、正确性校验、公平测量和结果复现，不自行设计索引算法，也不对用户原始数据设统一键长或字节数上限。
 
-这两侧的规定已写入 [数据接入约定](docs/DATASET_CONTRACT.md) 和 [实现接口契约](docs/INDEX_CONTRACT.md)，实现接口的 C++17 签名在 [index_contract.h](src/index_contract.h)。目标使用流程及报告要求见 [统一入口目标](docs/BENCHMARK.md#产品目标与两侧边界)。**统一入口尚未实现**；当前可运行的是 TLI 字符串测试的单线程子集，包含 ART 和 `std::map`，下文的格式和规模限制属于这个现有开发入口。
+这两侧的规定已写入 [数据接入约定](docs/DATASET_CONTRACT.md) 和 [实现接口契约](docs/INDEX_CONTRACT.md)，实现接口的 C++17 签名在 [index_contract.h](src/index_contract.h)。**统一入口已提供静态点查询第一版**，支持外部数据、C++17 适配包、多实现对比、独立校验和详细报告。使用方式与当前边界见 [统一入口说明](docs/UNIFIED_BENCHMARK.md)，本周改进见 [2026-09-26 改进记录](docs/WEEKLY_UPDATE_2026-09-26.md)。完整目标见 [评测范围](docs/BENCHMARK.md#产品目标与两侧边界)。
 
-## 快速开始
+## 快速开始：统一入口
+
+需要 Python 3.9+、CMake 和支持 C++17 的编译器；本例无需下载 TLI/GRE、安装 Boost 或准备专用二进制数据：
+
+```bash
+python3 -B scripts/benchmark.py \
+  --dataset examples/keys.txt \
+  --implementation adapters/std_map \
+  --implementation adapters/sorted_vector \
+  --output results/my-first-evaluation
+```
+
+把数据和适配包路径换成自己的位置即可运行；输出目录必须尚不存在。先看生成的 `report.md` 中文报告，再按需查看 `report.json`、`summary.csv` 和 `samples.csv`。两个自带基线用于验证接入，完整参数见 `python3 -B scripts/benchmark.py --help` 和 [使用说明](docs/UNIFIED_BENCHMARK.md)。
+
+## 旧 TLI 开发入口
+
+以下 setup、smoke、负载生成和真实数据示例属于保留的 TLI 开发入口，包含 ART 和旧 StdMap。它们的格式和规模限制不作为新统一入口的通用限制。
 
 已验证环境：Ubuntu 24.04 x86-64、GCC 13、CMake 3.28、Python 3.13。需要 `git`、`g++`、`cmake`、`ninja`、Python 3.9+；构建使用 C++17 和本机指令集。默认双任务编译，小规模 smoke 单线程运行。
 
@@ -99,6 +115,10 @@ python3 -B scripts/make_dataset.py data/sample_string --input /path/to/strings.t
 
 | 路径 | 用途 |
 | --- | --- |
+| `scripts/benchmark.py` | 统一静态点查询入口：数据读取、适配构建、校验、测量与报告 |
+| `src/unified/` | 使用 v1 接口的独立 C++17 评测程序 |
+| `adapters/` | map 与排序数组的示例适配包 |
+| `docs/UNIFIED_BENCHMARK.md` | 统一入口使用说明与覆盖边界 |
 | `src/string_benchmark.cpp` | TLI 字符串执行入口，索引选择与错误返回 |
 | `src/std_map.h` | 与 TLI 接口兼容的对照索引 |
 | `src/checked_index.h` | 独立校验适配器、插入及最终键值读回 |

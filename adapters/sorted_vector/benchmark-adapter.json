@@ -1,0 +1,8 @@
+{
+  "contract": "string-index/v1",
+  "id": "sorted-vector",
+  "source_dir": ".",
+  "cmake_target": "sorted_vector_adapter",
+  "factory_header": "sorted_vector_adapter.h",
+  "factory_symbol": "make_sorted_vector_index"
+}

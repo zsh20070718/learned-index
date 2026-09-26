@@ -1,6 +1,6 @@
 # 数据接入约定：原始数据尽可能不受限
 
-状态：后续统一评测入口的设计规范，尚未接入现有 TLI runner。这里规定 benchmark 如何接收数据，不要求用户先制作一种“benchmark 专用数据集”。实现侧见 [INDEX_CONTRACT.md](INDEX_CONTRACT.md)。
+状态：统一评测入口的数据规范；[静态点查询第一版](UNIFIED_BENCHMARK.md) 已接入单文件 reader 和规范键视图，目录分片、清单和外部 reader 插件仍待实现。旧 TLI runner 保留独立流程。这里规定 benchmark 如何接收数据，不要求用户先制作一种“benchmark 专用数据集”。实现侧见 [INDEX_CONTRACT.md](INDEX_CONTRACT.md)。
 
 ## 1. 用户交付的是位置
 
@@ -25,9 +25,9 @@
 1. 核心之外的 reader 理解文件格式、分片和字段选择，逐条输出有长度的键字节；它可以是内置 reader，也可以是外部 reader。
 2. 核心只消费键，不认识 URL、词表、JSON、数据库导出或其他来源格式。增加数据来源只增加 reader，不修改索引接口和评测逻辑。
 
-能明确识别的格式使用内置 reader；格式或取键存在歧义时要求指定 `--reader` / `--key`，并在构建实现前报出缺少的信息。未知格式允许接入 reader，不以“不属于预置数据集”拒绝。内置 reader 的实际支持清单必须由未来脚本的 `--help` 给出，不能把设计支持写成已实现支持。
+能明确识别的格式使用内置 reader；格式或取键存在歧义时要求指定 `--reader` / `--key`，并在构建实现前报出缺少的信息。未知格式允许接入 reader，不以“不属于预置数据集”拒绝。内置 reader 的实际支持清单由 `scripts/benchmark.py --help` 给出，不能把设计支持写成已实现支持。
 
-reader 的逻辑协议如下；这是后续 loader 的接口要求，不是已实现的 Python API：
+reader 的逻辑协议如下；这是扩展接口的语义要求，具体 Python 函数签名以当前实现为准：
 
 ```python
 iter_keys(dataset_location, reader_options) -> Iterator[bytes]
