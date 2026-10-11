@@ -1,4 +1,4 @@
-# 统一评测入口：静态点查询第一版
+# 统一评测入口：静态点查询与访问分布
 
 本入口把“数据在哪里、实现在哪里”接成一条可运行的流程：读取用户数据，准备相同的键和查询，构建适配器，检查正确性，重复测量，再生成报告。
 
@@ -60,7 +60,7 @@ python3 -B scripts/benchmark.py \
 
 每个实现复用相同的规范键值和查询序列。默认使用固定种子的均匀点查询，混合命中与未命中；负载参数和实际数量展开记录在报告中。
 
-默认配置如下，可以保存为 JSON 文件并通过 `--workload /path/to/workload.json` 使用。省略的字段沿用默认值，未知字段会被拒绝：
+默认配置如下，可以保存为 JSON 文件并通过 `--workload /path/to/workload.json` 使用。省略的字段沿用默认值，未知字段会被拒绝。旧版 `static-uniform-point/v1` 的字段和查询生成顺序保持不变；省略 `--workload` 仍使用这一版：
 
 ```json
 {
@@ -74,6 +74,55 @@ python3 -B scripts/benchmark.py \
 ```
 
 `operations` 是每轮的查询数量，不是从数据里抽取的键数；所有唯一键都会参与构建。未命中数量为 `floor(operations × miss_ratio)`，缺失键会检查确实不在完整键集合中。`latency_samples` 是每轮单独测量的查询样本数，实际不超过查询总数；它不改变吞吐量轮次的查询数量。设为 0 可关闭延迟测量，此时相关指标标为未测量，不填成零耗时。
+
+### 用同一个入口测试热点与偏斜访问
+
+`static-point/v2` 在相同静态查询流程中增加 `distribution`。三份示例可直接比较：
+
+```bash
+for distribution in uniform hotspot zipf; do
+  python3 -B scripts/benchmark.py \
+    --dataset examples/keys.txt \
+    --implementation adapters/std_map \
+    --implementation adapters/sorted_vector \
+    --workload "examples/workloads/${distribution}.json" \
+    --output "results/access-${distribution}" || break
+done
+```
+
+每份输出目录都必须尚不存在。换成自己的同一份数据与适配器路径，即可保持两侧不变，只改变访问场景。三份配置均为每轮 10,000 次查询、10% 未命中、3 轮重复、每轮 1,000 个延迟样本。
+
+| `distribution` | 访问方式 | 额外参数 |
+| --- | --- | --- |
+| `uniform` | 从所有源键中等概率有放回抽样 | 无 |
+| `hotspot` | 先选择热区或冷区，再在该区均匀抽样 | `hotset_fraction` 默认 `"0.1"`；`hot_probability` 默认 `"0.9"` |
+| `zipf` | 第 r 个源键的权重为 r^(-指数)，在有限键集合内归一化 | `zipf_exponent` 默认 `"1.1"`，范围 0–3 |
+
+热点配置的完整例子：
+
+```json
+{
+  "schema": "static-point/v2",
+  "distribution": "hotspot",
+  "hotset_fraction": "0.1",
+  "hot_probability": "0.9",
+  "seed": 42,
+  "operations": 10000,
+  "miss_ratio": "0.1",
+  "repeats": 3,
+  "latency_samples": 1000
+}
+```
+
+热区是字节排序后前 `max(1, min(N-1, floor(N × hotset_fraction)))` 个唯一键。`hotset_fraction` 必须严格在 0–1 之间，`hot_probability` 可取 0 或 1。热点场景要求至少两个唯一键，以保留冷热两区；单键数据明确报负载错误，空数据沿用跳过规则。热点比例按概率采样，实际访问次数不强行凑成 90%。
+
+Zipf 的 r 是字节排序后的名次，从 1 开始；它不是从流量日志学习的排名。指数为 0 时复用均匀抽样；更大的指数会更集中地访问前面的键。生成器使用浮点累计权重表和二分抽样，额外空间 O(N)、时间 O(N + operations × log N)，创建累计表前先计入准备预算。该表只影响负载准备，不计入索引性能。
+
+`v2` 省略 `distribution` 时使用 `uniform`，公共参数的默认值与 v1 一致。不同分布的专属参数不能混用，比如 uniform 带 `zipf_exponent` 会报错，避免参数被悄悄忽略。v1 不能带 v2 字段。十进制参数保留精确文本，支持字符串或 JSON 数字；最多 32 位有效数字、十进制指数绝对值最多 32，避免异常精度造成过大运算。
+
+源键抽样与未命中位置使用独立随机流：只改未命中率时，源键访问顺序保持不变。未命中键仍由选中的源键加后缀生成，并检查不属于完整数据集。报告中的热区比例只统计**命中查询**，不把缺失键算成热区成员；全部未命中时该比例标为未测量。
+
+v2 的 `report.json` 保留分布参数、实际命中/未命中数、命中访问覆盖的唯一键数，以及热点命中比例或第 1 名键的命中比例。`report.md` 展示这些实际数值并说明合成分布的含义；查询文件哈希确认本次使用的完整序列。文件身份与固定种子便于复查同一实验，跨 Python 版本时仍应核对查询哈希。
 
 `--memory-budget-mib` 默认 1024，用于检查 Python 数据/负载准备阶段的内存估算。这是可调整的本次运行预算，不是数据集接收规范中的固定大小上限，也不是操作系统对整个评测进程的硬内存限制。预算不足应调整预算或明确准备较小实验数据，程序不自动抽样。
 

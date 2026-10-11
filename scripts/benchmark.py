@@ -79,8 +79,9 @@ def parser() -> argparse.ArgumentParser:
         "--workload",
         type=Path,
         help=(
-            "static-uniform-point/v1 JSON overriding seed/operations/"
-            "miss_ratio/repeats/latency_samples"
+            "static-uniform-point/v1 or static-point/v2 JSON overriding "
+            "seed/operations/miss_ratio/repeats/latency_samples; "
+            "v2 supports uniform, hotspot and Zipf access"
         ),
     )
     result.add_argument(
@@ -265,7 +266,7 @@ def _unavailable_dataset_metadata(args: argparse.Namespace, status: str) -> Dict
 
 def _unavailable_workload_metadata(args: argparse.Namespace, status: str) -> Dict[str, Any]:
     return {
-        "schema": "static-uniform-point/v1",
+        "schema": None,
         "source": str(args.workload.resolve()) if args.workload else None,
         "status": status,
         "actual_operations": None,
@@ -413,6 +414,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             args, output, manifest_entries, workload, str(error), dataset.metadata()
         )
     except InputError as error:
+        workload_metadata = workload.metadata(0, 0)
+        workload_metadata["actual_operations"] = None
+        workload_metadata["controlled_misses"] = None
         return _invalid_input_report(
             args,
             output,
@@ -420,6 +424,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "workload",
             str(error),
             dataset_metadata=dataset.metadata(),
+            workload_metadata=workload_metadata,
         )
 
     if not _create_output(output):
@@ -463,7 +468,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         )
 
-    workload_metadata = workload.metadata(len(queries), miss_count)
+    workload_metadata = workload.metadata(len(queries), miss_count, queries, len(dataset.keys))
     workload_metadata["queries_sha256"] = queries_sha256
     config = _config_metadata(args, output)
     dataset_metadata = dataset.metadata()

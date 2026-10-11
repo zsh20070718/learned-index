@@ -306,6 +306,7 @@ def write_reports(
             _markdown_cell(workload.get("controlled_misses")),
             _markdown_cell(workload.get("repeats")),
         ),
+        *_workload_lines(workload),
         "",
         "## 实现结果",
         "",
@@ -343,3 +344,55 @@ def write_reports(
         ]
     )
     (output / "report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def _workload_lines(workload: Dict[str, Any]) -> List[str]:
+    distribution = workload.get("distribution")
+    if distribution is None and workload.get("schema") == "static-uniform-point/v1":
+        distribution = "uniform"
+    label = {
+        "uniform": "均匀访问（uniform）",
+        "hotspot": "热点访问（hotspot）",
+        "zipf": "Zipf 偏斜访问（zipf）",
+    }.get(distribution, "未确定")
+    lines = ["- 访问分布：{}".format(label)]
+    parameters = workload.get("distribution_parameters") or {}
+    if distribution == "hotspot":
+        lines.append(
+            "- 热区参数：源键比例 {}；抽取热区的概率 {}（实际次数允许波动）。".format(
+                _markdown_cell(parameters.get("hotset_fraction_decimal")),
+                _markdown_cell(parameters.get("hot_probability_decimal")),
+            )
+        )
+    elif distribution == "zipf":
+        lines.append(
+            "- Zipf 指数：{}；按字节排序名次 r 使用权重 r^(-指数)，指数 0 为均匀访问。".format(
+                _markdown_cell(parameters.get("zipf_exponent_decimal")),
+            )
+        )
+    observed = workload.get("observed")
+    if isinstance(observed, dict):
+        lines.append(
+            "- 实际命中：{}；实际未命中：{}；命中访问覆盖 {} 个不同键。".format(
+                _markdown_cell(observed.get("hit_queries")),
+                _markdown_cell(observed.get("miss_queries")),
+                _markdown_cell(observed.get("unique_hit_keys")),
+            )
+        )
+        if distribution in ("hotspot", "zipf"):
+            fraction = observed.get(
+                "hotset_hit_fraction" if distribution == "hotspot" else "rank_one_hit_fraction"
+            )
+            share = "{:.2%}".format(fraction) if fraction is not None else "未测量（没有命中查询）"
+            detail = (
+                "热区含 {} 个键；命中查询访问热区的比例：{}".format(
+                    _markdown_cell(observed.get("hotset_key_count")), share,
+                )
+                if distribution == "hotspot" else "命中查询访问第 1 名键的比例：{}".format(share)
+            )
+            lines.append("- {}。".format(detail))
+    if distribution in ("hotspot", "zipf"):
+        lines.append("- 热区和 Zipf 名次由字节排序决定，是合成访问模型，未从真实流量估计；未命中键由选中的源键变异生成。")
+    if workload.get("queries_sha256"):
+        lines.append("- 查询序列哈希（SHA-256）：`{}`".format(workload["queries_sha256"]))
+    return lines

@@ -4,7 +4,7 @@
 
 项目定位是**数据集与字符串索引实现之间的评测层**：用户指定数据集位置和实现位置，运行统一脚本，得到详细评测结果。数据来源与实现均独立于本项目；我们负责接入、负载、正确性校验、公平测量和结果复现，不自行设计索引算法，也不对用户原始数据设统一键长或字节数上限。
 
-这两侧的规定已写入 [数据接入约定](docs/DATASET_CONTRACT.md) 和 [实现接口契约](docs/INDEX_CONTRACT.md)，实现接口的 C++17 签名在 [index_contract.h](src/index_contract.h)。**统一入口已提供静态点查询第一版**，支持外部数据、C++17 适配包、多实现对比、独立校验和详细报告。使用方式与当前边界见 [统一入口说明](docs/UNIFIED_BENCHMARK.md)，本周改进见 [2026-09-26 改进记录](docs/WEEKLY_UPDATE_2026-09-26.md)。完整目标见 [评测范围](docs/BENCHMARK.md#产品目标与两侧边界)。
+这两侧的规定已写入 [数据接入约定](docs/DATASET_CONTRACT.md) 和 [实现接口契约](docs/INDEX_CONTRACT.md)，实现接口的 C++17 签名在 [index_contract.h](src/index_contract.h)。**统一入口支持静态点查询**，可接入外部数据和 C++17 适配包，比较均匀、热点、Zipf 访问，并提供独立校验和详细报告。使用方式与当前边界见 [统一入口说明](docs/UNIFIED_BENCHMARK.md)，本周改进见 [2026-10-11 改进记录](docs/WEEKLY_UPDATE_2026-10-11.md)，上一版见 [2026-09-26 记录](docs/WEEKLY_UPDATE_2026-09-26.md)。完整目标见 [评测范围](docs/BENCHMARK.md#产品目标与两侧边界)。
 
 ## 快速开始：统一入口
 
@@ -19,6 +19,8 @@ python3 -B scripts/benchmark.py \
 ```
 
 把数据和适配包路径换成自己的位置即可运行；输出目录必须尚不存在。先看生成的 `report.md` 中文报告，再按需查看 `report.json`、`summary.csv` 和 `samples.csv`。两个自带基线用于验证接入，完整参数见 `python3 -B scripts/benchmark.py --help` 和 [使用说明](docs/UNIFIED_BENCHMARK.md)。
+
+评测层还提供三份可直接使用的访问场景。把 `--workload examples/workloads/hotspot.json` 加入上述命令即可测热点访问；`uniform.json` 和 `zipf.json` 分别对应均匀和 Zipf 访问。三份配置使用相同的查询数、种子、未命中率和重复次数，便于在相同数据及实现上逐项对照。原始数据和索引源码无需修改。
 
 ## 旧 TLI 开发入口
 
@@ -118,6 +120,7 @@ python3 -B scripts/make_dataset.py data/sample_string --input /path/to/strings.t
 | `scripts/benchmark.py` | 统一静态点查询入口：数据读取、适配构建、校验、测量与报告 |
 | `src/unified/` | 使用 v1 接口的独立 C++17 评测程序 |
 | `adapters/` | map 与排序数组的示例适配包 |
+| `examples/workloads/` | 统一入口的均匀、热点、Zipf 场景配置 |
 | `docs/UNIFIED_BENCHMARK.md` | 统一入口使用说明与覆盖边界 |
 | `src/string_benchmark.cpp` | TLI 字符串执行入口，索引选择与错误返回 |
 | `src/std_map.h` | 与 TLI 接口兼容的对照索引 |
