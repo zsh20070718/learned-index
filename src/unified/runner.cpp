@@ -166,6 +166,47 @@ bool supported(v1::Support support) {
   return support == v1::Support::native || support == v1::Support::adapted;
 }
 
+const char* operation_name(OperationKind kind) {
+  switch (kind) {
+    case OperationKind::find:
+      return "find";
+    case OperationKind::insert:
+      return "insert";
+    case OperationKind::update:
+      return "update";
+    case OperationKind::erase:
+      return "erase";
+    case OperationKind::scan:
+      return "scan";
+  }
+  return "unknown";
+}
+
+OperationCounts count_operations(const std::vector<Operation>& operations) {
+  OperationCounts counts;
+  for (const auto& operation : operations) {
+    switch (operation.kind) {
+      case OperationKind::find:
+        ++counts.find;
+        break;
+      case OperationKind::insert:
+        ++counts.insert;
+        break;
+      case OperationKind::update:
+        ++counts.update;
+        break;
+      case OperationKind::erase:
+        ++counts.erase;
+        break;
+      case OperationKind::scan:
+        ++counts.scan;
+        break;
+    }
+    ++counts.total;
+  }
+  return counts;
+}
+
 bool any_adapted(const v1::Capabilities& capabilities) {
   return capabilities.bulk_load == v1::Support::adapted ||
          capabilities.find == v1::Support::adapted ||
@@ -308,6 +349,38 @@ std::optional<std::string> validate_domain(
       if (is_proper_prefix((*unique_keys)[i - 1], (*unique_keys)[i])) {
         return "complete row/query domain contains a prefix key pair";
       }
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> validate_mixed_domain(
+    const v1::Capabilities& capabilities, const std::vector<v1::Row>& rows,
+    const std::vector<Operation>& operations,
+    std::vector<std::string>* unique_keys) {
+  std::vector<Query> operation_keys;
+  operation_keys.reserve(operations.size());
+  for (const auto& operation : operations) {
+    operation_keys.push_back({operation.key, false, 0});
+  }
+  if (auto error =
+          validate_domain(capabilities, rows, operation_keys, unique_keys)) {
+    return error;
+  }
+  for (std::size_t i = 0; i < operations.size(); ++i) {
+    const auto& operation = operations[i];
+    if ((operation.kind == OperationKind::insert ||
+         operation.kind == OperationKind::update) &&
+        operation.value > capabilities.max_value) {
+      return "operation value at index " + std::to_string(i) +
+             " exceeds the declared maximum";
+    }
+    if (operation.kind == OperationKind::scan &&
+        operation.limit >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
+      return "scan limit at index " + std::to_string(i) +
+             " exceeds the native size range";
     }
   }
   return std::nullopt;
@@ -566,6 +639,35 @@ auto adapter_repeated_call(const char* call, const char* location,
   }
 }
 
+template <class Function>
+auto adapter_operation_call(OperationKind kind, const char* stage,
+                            std::size_t ordinal, Function&& function)
+    -> decltype(function()) {
+  try {
+    return function();
+  } catch (...) {
+    throw std::runtime_error(std::string("adapter ") + operation_name(kind) +
+                             " call failed at " + stage +
+                             " operation ordinal " +
+                             std::to_string(ordinal));
+  }
+}
+
+template <class Function>
+auto adapter_timed_operation_call(OperationKind kind, std::size_t repeat,
+                                  std::size_t ordinal, Function&& function)
+    -> decltype(function()) {
+  try {
+    return function();
+  } catch (...) {
+    throw std::runtime_error(std::string("adapter ") + operation_name(kind) +
+                             " call failed at throughput repeat " +
+                             std::to_string(repeat) +
+                             " operation ordinal " +
+                             std::to_string(ordinal));
+  }
+}
+
 void require_stable_descriptor(const v1::Descriptor& expected,
                                const v1::Descriptor& actual) {
   if (!same_descriptor(expected, actual)) {
@@ -604,6 +706,22 @@ void consume(const std::optional<v1::Value>& value, std::uint64_t* checksum) {
             : UINT64_C(0xd1b54a32d192ed03);
   *checksum ^= token + UINT64_C(0x9e3779b97f4a7c15) + (*checksum << 6U) +
                (*checksum >> 2U);
+}
+
+void consume_u64(std::uint64_t value, std::uint64_t* checksum) {
+  consume(std::optional<v1::Value>(value), checksum);
+}
+
+void consume_rows(const std::vector<v1::Row>& rows,
+                  std::uint64_t* checksum) {
+  consume_u64(static_cast<std::uint64_t>(rows.size()), checksum);
+  for (const auto& row : rows) {
+    consume_u64(static_cast<std::uint64_t>(row.key.size()), checksum);
+    for (unsigned char byte : row.key) {
+      consume_u64(byte, checksum);
+    }
+    consume_u64(row.value, checksum);
+  }
 }
 
 struct ParallelWorkerResult {
@@ -835,7 +953,8 @@ std::filesystem::path canonical_cli_path(const std::string& path,
   return canonical;
 }
 
-void preflight_cli_paths(const std::map<std::string, std::string>& options) {
+void preflight_cli_paths(const std::map<std::string, std::string>& options,
+                         const std::string& workload_option) {
   for (const char* option : {"--result", "--samples"}) {
     std::error_code error;
     const bool exists = std::filesystem::exists(options.at(option), error);
@@ -850,8 +969,9 @@ void preflight_cli_paths(const std::map<std::string, std::string>& options) {
   }
 
   const auto rows = canonical_cli_path(options.at("--rows"), "rows input");
-  const auto queries =
-      canonical_cli_path(options.at("--queries"), "queries input");
+  const auto workload = canonical_cli_path(
+      options.at(workload_option),
+      workload_option == "--queries" ? "queries input" : "operations input");
   const auto result =
       canonical_cli_path(options.at("--result"), "result output");
   const auto samples =
@@ -859,10 +979,37 @@ void preflight_cli_paths(const std::map<std::string, std::string>& options) {
   if (result == samples) {
     throw std::invalid_argument("result and samples paths collide");
   }
-  if (result == rows || result == queries || samples == rows ||
-      samples == queries) {
+  if (result == rows || result == workload || samples == rows ||
+      samples == workload) {
     throw std::invalid_argument("an output path collides with an input path");
   }
+}
+
+bool ascii_alpha(char value) {
+  return (value >= 'A' && value <= 'Z') ||
+         (value >= 'a' && value <= 'z');
+}
+
+bool ascii_alnum(char value) {
+  return ascii_alpha(value) || (value >= '0' && value <= '9');
+}
+
+std::pair<std::string, std::string> parse_parameter_argument(
+    const std::string& argument) {
+  const std::size_t separator = argument.find('=');
+  if (separator == std::string::npos) {
+    throw std::invalid_argument(
+        "--parameter must have the form NAME=VALUE");
+  }
+  const std::string name = argument.substr(0, separator);
+  if (name.empty() || name.size() > 128 || !ascii_alpha(name.front()) ||
+      !std::all_of(name.begin() + 1, name.end(), [](char value) {
+        return ascii_alnum(value) || value == '_' || value == '.' ||
+               value == '-';
+      })) {
+    throw std::invalid_argument("invalid --parameter name");
+  }
+  return {name, argument.substr(separator + 1)};
 }
 
 void write_exclusive_file(const std::string& path, const std::string& contents,
@@ -931,6 +1078,45 @@ std::vector<Query> read_queries(std::istream& input) {
   return queries;
 }
 
+std::vector<Operation> read_operations(std::istream& input) {
+  check_magic(input, {'S', 'I', 'B', 'O', 'P', 'S', '1', '\0'},
+              "operations");
+  const std::uint64_t count = read_u64(input, "operation count");
+  const std::uint64_t bytes = remaining_bytes(input);
+  constexpr std::uint64_t kMinimumOperationBytes = 25;
+  require_record_capacity(count, bytes, kMinimumOperationBytes,
+                          "operation count");
+  std::vector<Operation> operations;
+  for (std::uint64_t i = 0; i < count; ++i) {
+    char raw_kind = 0;
+    read_exact(input, &raw_kind, 1, "operation kind");
+    const auto kind_value = static_cast<unsigned char>(raw_kind);
+    if (kind_value < static_cast<unsigned char>(OperationKind::find) ||
+        kind_value > static_cast<unsigned char>(OperationKind::scan)) {
+      malformed("unknown operation kind at index " + std::to_string(i));
+    }
+    Operation operation;
+    operation.kind = static_cast<OperationKind>(kind_value);
+    operation.value = read_u64(input, "operation value");
+    operation.limit = read_u64(input, "operation limit");
+    if (operation.kind != OperationKind::insert &&
+        operation.kind != OperationKind::update && operation.value != 0) {
+      malformed("unused operation value must be zero at index " +
+                std::to_string(i));
+    }
+    if (operation.kind != OperationKind::scan && operation.limit != 0) {
+      malformed("unused operation limit must be zero at index " +
+                std::to_string(i));
+    }
+    const std::uint64_t records_after = count - i - 1;
+    operation.key = read_key(input, "operation key",
+                             records_after * kMinimumOperationBytes);
+    operations.push_back(std::move(operation));
+  }
+  check_eof(input);
+  return operations;
+}
+
 std::vector<v1::Row> read_rows_file(const std::string& path) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
@@ -947,6 +1133,14 @@ std::vector<Query> read_queries_file(const std::string& path) {
   return read_queries(input);
 }
 
+std::vector<Operation> read_operations_file(const std::string& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open operations input");
+  }
+  return read_operations(input);
+}
+
 RunReport run_static_lookup(v1::Factory factory,
                             const v1::Parameters& parameters,
                             const std::vector<v1::Row>& rows,
@@ -955,6 +1149,7 @@ RunReport run_static_lookup(v1::Factory factory,
                             std::size_t latency_sample_count,
                             std::size_t threads) {
   RunReport report;
+  report.parameters = parameters;
   report.execution.threads = threads;
   report.execution.mode =
       threads == 1 ? "serial" : "shared-index-read-only";
@@ -1264,12 +1459,594 @@ RunReport run_static_lookup(v1::Factory factory,
   }
 }
 
+MixedRunReport run_mixed_operations(
+    v1::Factory factory, const v1::Parameters& parameters,
+    const std::vector<v1::Row>& rows,
+    const std::vector<Operation>& operations, std::size_t repeats,
+    std::size_t latency_sample_count, std::size_t threads) {
+  MixedRunReport report;
+  report.parameters = parameters;
+  report.execution.threads = threads;
+  report.execution.mode =
+      threads == 1 ? "serial" : "unsupported-mixed-parallel";
+  report.configured_operations = count_operations(operations);
+  report.initial_key_count = rows.size();
+  std::set<std::string, UnsignedByteLess> touched_keys;
+  for (const auto& operation : operations) {
+    touched_keys.insert(operation.key);
+  }
+  report.touched_keys = touched_keys.size();
+
+  if (threads == 0) {
+    report.status = "invalid_input";
+    report.stage = "execution";
+    report.reason = "threads must be in the range 1..256";
+    return report;
+  }
+  if (threads > 1) {
+    report.status = "unsupported";
+    report.stage = "execution";
+    report.reason = "mixed operations require serial execution";
+    return report;
+  }
+  if (latency_sample_count != 0) {
+    report.status = "invalid_input";
+    report.stage = "configuration";
+    report.reason = "mixed operation latency samples must be zero";
+    return report;
+  }
+  if (repeats == 0) {
+    report.status = "invalid_input";
+    report.stage = "configuration";
+    report.reason = "repeats must be positive";
+    return report;
+  }
+
+  try {
+    report.stage = "interchange";
+    Oracle oracle = make_oracle(rows);
+
+    report.stage = "descriptor";
+    auto descriptor_instance =
+        make_index(factory, parameters, "descriptor instance");
+    const v1::Descriptor descriptor = adapter_call(
+        "descriptor", "descriptor instance",
+        [&] { return descriptor_instance->descriptor(); });
+    report.descriptor = descriptor;
+    if (auto error = validate_descriptor(descriptor)) {
+      report.status = "invalid_input";
+      report.reason = *error;
+      return report;
+    }
+    report.validation.descriptor_checked = true;
+
+    std::vector<std::string> unsupported_operations;
+    if (report.configured_operations.insert != 0 &&
+        !supported(descriptor.capabilities.insert)) {
+      unsupported_operations.push_back("insert");
+    }
+    if (report.configured_operations.update != 0 &&
+        !supported(descriptor.capabilities.update)) {
+      unsupported_operations.push_back("update");
+    }
+    if (report.configured_operations.erase != 0 &&
+        !supported(descriptor.capabilities.erase)) {
+      unsupported_operations.push_back("erase");
+    }
+    if (report.configured_operations.scan != 0 &&
+        !supported(descriptor.capabilities.scan)) {
+      unsupported_operations.push_back("scan");
+    }
+    if (!unsupported_operations.empty()) {
+      report.status = "unsupported";
+      report.stage = "capabilities";
+      report.reason = "unsupported operation kinds: ";
+      for (std::size_t i = 0; i < unsupported_operations.size(); ++i) {
+        if (i != 0) {
+          report.reason += ", ";
+        }
+        report.reason += unsupported_operations[i];
+      }
+      return report;
+    }
+
+    std::vector<std::string> complete_domain;
+    if (auto error = validate_mixed_domain(
+            descriptor.capabilities, rows, operations, &complete_domain)) {
+      report.status = "unsupported";
+      report.stage = "capabilities";
+      report.reason = *error;
+      return report;
+    }
+    report.validation.capability_domain_checked = true;
+    descriptor_instance.reset();
+
+    report.stage = "correctness";
+    auto empty_index = make_index(factory, parameters, "empty-build instance");
+    require_stable_descriptor(
+        descriptor, adapter_call("descriptor", "empty-build instance before build",
+                                 [&] { return empty_index->descriptor(); }));
+    const std::vector<v1::Row> empty_rows;
+    adapter_call("bulk_load", "empty-build instance",
+                 [&] { empty_index->bulk_load(empty_rows); });
+    require_stable_descriptor(
+        descriptor, adapter_call("descriptor", "empty-build instance after build",
+                                 [&] { return empty_index->descriptor(); }));
+    for (std::size_t i = 0; i < complete_domain.size(); ++i) {
+      require_find(adapter_indexed_call(
+                       "find", "mixed empty-build domain", i,
+                       [&] { return empty_index->find(complete_domain[i]); }),
+                   false, 0,
+                   "mixed empty-build probe at domain index " +
+                       std::to_string(i));
+    }
+    for (std::size_t i = 0; i < operations.size(); ++i) {
+      if (operations[i].kind != OperationKind::scan) {
+        continue;
+      }
+      const auto scan_rows = adapter_operation_call(
+          OperationKind::scan, "empty-build validation", i, [&] {
+            return empty_index->scan(
+                operations[i].key,
+                static_cast<std::size_t>(operations[i].limit));
+          });
+      if (!scan_rows.empty()) {
+        throw std::runtime_error(
+            "empty-build scan returned rows at operation ordinal " +
+            std::to_string(i));
+      }
+    }
+    report.validation.empty_build_checked = true;
+    empty_index.reset();
+
+    auto correctness_index =
+        make_index(factory, parameters, "mixed correctness instance");
+    require_stable_descriptor(
+        descriptor,
+        adapter_call("descriptor", "mixed correctness instance before build",
+                     [&] { return correctness_index->descriptor(); }));
+    adapter_call("bulk_load", "mixed correctness instance",
+                 [&] { correctness_index->bulk_load(rows); });
+    require_stable_descriptor(
+        descriptor,
+        adapter_call("descriptor", "mixed correctness instance after build",
+                     [&] { return correctness_index->descriptor(); }));
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      require_find(adapter_indexed_call(
+                       "find", "mixed represented row", i,
+                       [&] { return correctness_index->find(rows[i].key); }),
+                   true, rows[i].value,
+                   "mixed represented row at index " + std::to_string(i));
+      ++report.validation.initial_rows_checked;
+    }
+    if (!rows.empty()) {
+      require_find(adapter_indexed_call(
+                       "find", "mixed represented boundary", 0,
+                       [&] { return correctness_index->find(rows.front().key); }),
+                   true, rows.front().value,
+                   "first mixed represented-key boundary");
+      require_find(adapter_indexed_call(
+                       "find", "mixed represented boundary", rows.size() - 1,
+                       [&] { return correctness_index->find(rows.back().key); }),
+                   true, rows.back().value,
+                   "last mixed represented-key boundary");
+    }
+    report.validation.represented_boundaries_checked = true;
+
+    MixedOutcomeCounts outcomes;
+    for (std::size_t i = 0; i < operations.size(); ++i) {
+      const auto& operation = operations[i];
+      switch (operation.kind) {
+        case OperationKind::find: {
+          const auto expected = oracle.find(operation.key);
+          const auto actual = adapter_operation_call(
+              operation.kind, "correctness", i,
+              [&] { return correctness_index->find(operation.key); });
+          require_find(actual, expected != oracle.end(),
+                       expected == oracle.end() ? 0 : expected->second,
+                       "mixed find at operation ordinal " +
+                           std::to_string(i));
+          if (expected == oracle.end()) {
+            ++outcomes.find_misses;
+          } else {
+            ++outcomes.find_hits;
+          }
+          break;
+        }
+        case OperationKind::insert: {
+          const auto expected = oracle.emplace(operation.key, operation.value);
+          const auto actual = adapter_operation_call(
+              operation.kind, "correctness", i, [&] {
+                return correctness_index->insert(operation.key,
+                                                 operation.value);
+              });
+          const auto expected_result =
+              expected.second ? v1::InsertResult::inserted
+                              : v1::InsertResult::already_exists;
+          if (actual != expected_result) {
+            throw std::runtime_error(
+                "mixed insert returned the wrong result at operation ordinal " +
+                std::to_string(i));
+          }
+          if (actual == v1::InsertResult::inserted) {
+            ++outcomes.insert_inserted;
+          } else {
+            ++outcomes.insert_already_exists;
+          }
+          require_find(adapter_operation_call(
+                           OperationKind::find, "affected-key validation", i,
+                           [&] { return correctness_index->find(operation.key); }),
+                       true, expected.first->second,
+                       "affected insert key at operation ordinal " +
+                           std::to_string(i));
+          break;
+        }
+        case OperationKind::update: {
+          const auto expected = oracle.find(operation.key);
+          const bool present = expected != oracle.end();
+          if (present) {
+            expected->second = operation.value;
+          }
+          const auto actual = adapter_operation_call(
+              operation.kind, "correctness", i, [&] {
+                return correctness_index->update(operation.key,
+                                                 operation.value);
+              });
+          const auto expected_result =
+              present ? v1::UpdateResult::updated
+                      : v1::UpdateResult::not_found;
+          if (actual != expected_result) {
+            throw std::runtime_error(
+                "mixed update returned the wrong result at operation ordinal " +
+                std::to_string(i));
+          }
+          if (actual == v1::UpdateResult::updated) {
+            ++outcomes.update_updated;
+          } else {
+            ++outcomes.update_not_found;
+          }
+          require_find(adapter_operation_call(
+                           OperationKind::find, "affected-key validation", i,
+                           [&] { return correctness_index->find(operation.key); }),
+                       present, present ? operation.value : 0,
+                       "affected update key at operation ordinal " +
+                           std::to_string(i));
+          break;
+        }
+        case OperationKind::erase: {
+          const auto expected = oracle.find(operation.key);
+          const bool present = expected != oracle.end();
+          if (present) {
+            oracle.erase(expected);
+          }
+          const auto actual = adapter_operation_call(
+              operation.kind, "correctness", i,
+              [&] { return correctness_index->erase(operation.key); });
+          const auto expected_result =
+              present ? v1::EraseResult::erased : v1::EraseResult::not_found;
+          if (actual != expected_result) {
+            throw std::runtime_error(
+                "mixed erase returned the wrong result at operation ordinal " +
+                std::to_string(i));
+          }
+          if (actual == v1::EraseResult::erased) {
+            ++outcomes.erase_erased;
+          } else {
+            ++outcomes.erase_not_found;
+          }
+          require_find(adapter_operation_call(
+                           OperationKind::find, "affected-key validation", i,
+                           [&] { return correctness_index->find(operation.key); }),
+                       false, 0,
+                       "affected erase key at operation ordinal " +
+                           std::to_string(i));
+          break;
+        }
+        case OperationKind::scan: {
+          std::vector<v1::Row> expected;
+          const std::size_t limit =
+              static_cast<std::size_t>(operation.limit);
+          auto current = oracle.lower_bound(operation.key);
+          while (current != oracle.end() && expected.size() < limit) {
+            expected.push_back({current->first, current->second});
+            ++current;
+          }
+          const auto actual = adapter_operation_call(
+              operation.kind, "correctness", i, [&] {
+                return correctness_index->scan(operation.key, limit);
+              });
+          if (actual.size() != expected.size() ||
+              !std::equal(actual.begin(), actual.end(), expected.begin(),
+                          [](const v1::Row& left, const v1::Row& right) {
+                            return left.key == right.key &&
+                                   left.value == right.value;
+                          })) {
+            throw std::runtime_error(
+                "mixed scan returned wrong rows at operation ordinal " +
+                std::to_string(i));
+          }
+          ++outcomes.scan_calls;
+          outcomes.scan_rows += actual.size();
+          break;
+        }
+      }
+      ++report.validation.operations_checked;
+    }
+    report.validation.trace_replay_checked = true;
+    report.validation.affected_keys_checked = true;
+
+    for (std::size_t i = 0; i < complete_domain.size(); ++i) {
+      const auto expected = oracle.find(complete_domain[i]);
+      require_find(adapter_indexed_call(
+                       "find", "mixed final state", i,
+                       [&] { return correctness_index->find(complete_domain[i]); }),
+                   expected != oracle.end(),
+                   expected == oracle.end() ? 0 : expected->second,
+                   "mixed final-state key at index " + std::to_string(i));
+    }
+    report.validation.touched_keys_checked = touched_keys.size();
+    report.validation.final_state_checked = true;
+    report.memory = adapter_call(
+        "memory_usage", "mixed correctness instance",
+        [&] { return correctness_index->memory_usage(); });
+    validate_memory(*report.memory);
+    const std::size_t final_key_count = oracle.size();
+    correctness_index.reset();
+
+    if (operations.empty()) {
+      report.status = "skipped";
+      report.stage = "measurement";
+      report.reason = "mixed operation workload is empty";
+      return report;
+    }
+
+    report.samples.reserve(repeats);
+    for (std::size_t repeat = 0; repeat < repeats; ++repeat) {
+      report.stage = "throughput";
+      const auto build_start = Clock::now();
+      auto index = make_index(
+          factory, parameters,
+          "mixed throughput repeat " + std::to_string(repeat));
+      adapter_call("bulk_load",
+                   "mixed throughput repeat " + std::to_string(repeat),
+                   [&] { index->bulk_load(rows); });
+      const auto build_end = Clock::now();
+      require_stable_descriptor(
+          descriptor,
+          adapter_call("descriptor",
+                       "mixed throughput repeat " + std::to_string(repeat),
+                       [&] { return index->descriptor(); }));
+
+      ThroughputSample sample;
+      sample.repeat = repeat;
+      sample.build_ns = elapsed_ns(build_start, build_end);
+      sample.operations = operations.size();
+      WorkerSample worker;
+      worker.worker = 0;
+      worker.operations = operations.size();
+      const auto lookup_start = Clock::now();
+      for (std::size_t i = 0; i < operations.size(); ++i) {
+        const auto& operation = operations[i];
+        switch (operation.kind) {
+          case OperationKind::find:
+            consume(adapter_timed_operation_call(
+                        operation.kind, repeat, i,
+                        [&] { return index->find(operation.key); }),
+                    &worker.checksum);
+            break;
+          case OperationKind::insert:
+            consume_u64(static_cast<std::uint64_t>(
+                            adapter_timed_operation_call(
+                                operation.kind, repeat, i, [&] {
+                                  return index->insert(operation.key,
+                                                       operation.value);
+                                })),
+                        &worker.checksum);
+            break;
+          case OperationKind::update:
+            consume_u64(static_cast<std::uint64_t>(
+                            adapter_timed_operation_call(
+                                operation.kind, repeat, i, [&] {
+                                  return index->update(operation.key,
+                                                       operation.value);
+                                })),
+                        &worker.checksum);
+            break;
+          case OperationKind::erase:
+            consume_u64(static_cast<std::uint64_t>(
+                            adapter_timed_operation_call(
+                                operation.kind, repeat, i,
+                                [&] { return index->erase(operation.key); })),
+                        &worker.checksum);
+            break;
+          case OperationKind::scan:
+            consume_rows(adapter_timed_operation_call(
+                             operation.kind, repeat, i, [&] {
+                               return index->scan(
+                                   operation.key,
+                                   static_cast<std::size_t>(operation.limit));
+                             }),
+                         &worker.checksum);
+            break;
+        }
+      }
+      const auto lookup_end = Clock::now();
+      worker.lookup_ns = elapsed_ns(lookup_start, lookup_end);
+      sample.lookup_ns = worker.lookup_ns;
+      sample.workers.push_back(worker);
+      consume_u64(worker.checksum, &report.checksum);
+      if (sample.lookup_ns == 0) {
+        throw std::runtime_error(
+            "mixed throughput duration is below clock resolution");
+      }
+      sample.throughput_ops_per_second =
+          static_cast<double>(sample.operations) * 1.0e9 /
+          static_cast<double>(sample.lookup_ns);
+      const v1::MemoryUsage memory = adapter_call(
+          "memory_usage",
+          "mixed throughput repeat " + std::to_string(repeat),
+          [&] { return index->memory_usage(); });
+      validate_memory(memory);
+      if (repeat == 0) {
+        report.memory = memory;
+      }
+      report.samples.push_back(std::move(sample));
+    }
+
+    report.outcomes = outcomes;
+    report.final_key_count = final_key_count;
+    report.status = "passed";
+    report.stage = "complete";
+    report.reason.clear();
+    return report;
+  } catch (const std::exception& error) {
+    report.status = report.stage == "interchange" ? "invalid_input" : "failed";
+    report.reason = error.what();
+    report.outcomes = {};
+    report.final_key_count.reset();
+    report.samples.clear();
+    report.latency_samples.clear();
+    report.checksum = 0;
+    return report;
+  } catch (...) {
+    report.status = "failed";
+    report.reason = "unknown exception";
+    report.outcomes = {};
+    report.final_key_count.reset();
+    report.samples.clear();
+    report.latency_samples.clear();
+    report.checksum = 0;
+    return report;
+  }
+}
+
+namespace {
+
+void write_parameters_json(std::ostream& output,
+                           const v1::Parameters& parameters) {
+  output << '[';
+  for (std::size_t i = 0; i < parameters.size(); ++i) {
+    if (i != 0) {
+      output << ',';
+    }
+    output << "{\"name\": " << json_escape(parameters[i].first)
+           << ", \"value\": " << json_escape(parameters[i].second) << '}';
+  }
+  output << ']';
+}
+
+void write_descriptor_json(std::ostream& output,
+                           const std::optional<v1::Descriptor>& value) {
+  if (!value) {
+    output << "null";
+    return;
+  }
+  const auto& descriptor = *value;
+  const auto& capabilities = descriptor.capabilities;
+  output << "{\n"
+         << "    \"implementation\": "
+         << json_escape(descriptor.implementation) << ",\n"
+         << "    \"implementation_version\": "
+         << json_escape(descriptor.implementation_version) << ",\n"
+         << "    \"adapter_version\": "
+         << json_escape(descriptor.adapter_version) << ",\n"
+         << "    \"adaptation_notes\": "
+         << json_escape(descriptor.adaptation_notes) << ",\n"
+         << "    \"capabilities\": {\n"
+         << "      \"keys\": {\"min_bytes\": "
+         << capabilities.keys.min_bytes << ", \"max_bytes\": ";
+  write_optional_u64(output, capabilities.keys.max_bytes);
+  output << ", \"fixed_bytes\": ";
+  write_optional_u64(output, capabilities.keys.fixed_bytes);
+  output << ", \"allows_nul\": "
+         << (capabilities.keys.allows_nul ? "true" : "false")
+         << ", \"allows_high_bit\": "
+         << (capabilities.keys.allows_high_bit ? "true" : "false")
+         << ", \"allows_prefix_pairs\": "
+         << (capabilities.keys.allows_prefix_pairs ? "true" : "false")
+         << "},\n"
+         << "      \"max_value\": " << capabilities.max_value << ",\n"
+         << "      \"bulk_load\": "
+         << json_escape(support_name(capabilities.bulk_load)) << ",\n"
+         << "      \"find\": "
+         << json_escape(support_name(capabilities.find)) << ",\n"
+         << "      \"insert\": "
+         << json_escape(support_name(capabilities.insert)) << ",\n"
+         << "      \"update\": "
+         << json_escape(support_name(capabilities.update)) << ",\n"
+         << "      \"erase\": "
+         << json_escape(support_name(capabilities.erase)) << ",\n"
+         << "      \"scan\": "
+         << json_escape(support_name(capabilities.scan)) << ",\n"
+         << "      \"range_sum\": "
+         << json_escape(support_name(capabilities.range_sum)) << ",\n"
+         << "      \"concurrent_find\": "
+         << (capabilities.concurrent_find ? "true" : "false") << "\n"
+         << "    }\n"
+         << "  }";
+}
+
+void write_memory_json(std::ostream& output,
+                       const std::optional<v1::MemoryUsage>& memory) {
+  if (!memory) {
+    output << "null";
+    return;
+  }
+  output << "{\"index_owned_bytes\": ";
+  write_optional_u64(output, memory->index_owned_bytes);
+  output << ", \"adapter_owned_bytes\": ";
+  write_optional_u64(output, memory->adapter_owned_bytes);
+  output << ", \"retained_input_bytes\": ";
+  write_optional_u64(output, memory->retained_input_bytes);
+  output << ", \"accounting_notes\": "
+         << json_escape(memory->accounting_notes) << '}';
+}
+
+void write_throughput_samples_json(
+    std::ostream& output, const std::vector<ThroughputSample>& samples) {
+  output << '[';
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    const auto& sample = samples[i];
+    if (i != 0) {
+      output << ',';
+    }
+    output << "\n    {\"repeat\": " << sample.repeat
+           << ", \"build_ns\": " << sample.build_ns
+           << ", \"latency_build_ns\": ";
+    write_optional_u64(output, sample.latency_build_ns);
+    output << ", \"lookup_ns\": " << sample.lookup_ns
+           << ", \"operations\": " << sample.operations
+           << ", \"throughput_ops_per_second\": " << std::setprecision(17)
+           << sample.throughput_ops_per_second << ", \"workers\": [";
+    for (std::size_t j = 0; j < sample.workers.size(); ++j) {
+      if (j != 0) {
+        output << ',';
+      }
+      const auto& worker = sample.workers[j];
+      output << "{\"worker\": " << worker.worker
+             << ", \"operations\": " << worker.operations
+             << ", \"lookup_ns\": " << worker.lookup_ns
+             << ", \"checksum\": " << worker.checksum << '}';
+    }
+    output << "]}";
+  }
+  if (!samples.empty()) {
+    output << '\n';
+  }
+  output << ']';
+}
+
+}  // namespace
+
 void write_result_json(std::ostream& output, const RunReport& report) {
   output << "{\n"
-         << "  \"schema\": \"string-index-static-run/v2\",\n"
+         << "  \"schema\": \"string-index-static-run/v3\",\n"
          << "  \"status\": " << json_escape(report.status) << ",\n"
          << "  \"stage\": " << json_escape(report.stage) << ",\n"
          << "  \"reason\": " << json_escape(report.reason) << ",\n"
+         << "  \"parameters\": ";
+  write_parameters_json(output, report.parameters);
+  output << ",\n"
          << "  \"execution\": {\"threads\": " << report.execution.threads
          << ", \"mode\": " << json_escape(report.execution.mode)
          << ", \"partition\": " << json_escape(report.execution.partition)
@@ -1408,6 +2185,86 @@ void write_result_json(std::ostream& output, const RunReport& report) {
   }
 }
 
+void write_mixed_result_json(std::ostream& output,
+                             const MixedRunReport& report) {
+  output << "{\n"
+         << "  \"schema\": \"string-index-mixed-run/v1\",\n"
+         << "  \"status\": " << json_escape(report.status) << ",\n"
+         << "  \"stage\": " << json_escape(report.stage) << ",\n"
+         << "  \"reason\": " << json_escape(report.reason) << ",\n"
+         << "  \"parameters\": ";
+  write_parameters_json(output, report.parameters);
+  output << ",\n"
+         << "  \"execution\": {\"threads\": " << report.execution.threads
+         << ", \"mode\": " << json_escape(report.execution.mode)
+         << ", \"partition\": " << json_escape(report.execution.partition)
+         << ", \"latency_mode\": "
+         << json_escape(report.execution.latency_mode) << "},\n"
+         << "  \"descriptor\": ";
+  write_descriptor_json(output, report.descriptor);
+  output << ",\n"
+         << "  \"validation\": {"
+         << "\"descriptor_checked\": "
+         << (report.validation.descriptor_checked ? "true" : "false")
+         << ", \"capability_domain_checked\": "
+         << (report.validation.capability_domain_checked ? "true" : "false")
+         << ", \"empty_build_checked\": "
+         << (report.validation.empty_build_checked ? "true" : "false")
+         << ", \"represented_boundaries_checked\": "
+         << (report.validation.represented_boundaries_checked ? "true"
+                                                               : "false")
+         << ", \"trace_replay_checked\": "
+         << (report.validation.trace_replay_checked ? "true" : "false")
+         << ", \"affected_keys_checked\": "
+         << (report.validation.affected_keys_checked ? "true" : "false")
+         << ", \"final_state_checked\": "
+         << (report.validation.final_state_checked ? "true" : "false")
+         << ", \"initial_rows_checked\": "
+         << report.validation.initial_rows_checked
+         << ", \"operations_checked\": "
+         << report.validation.operations_checked
+         << ", \"touched_keys_checked\": "
+         << report.validation.touched_keys_checked << "},\n"
+         << "  \"memory\": ";
+  write_memory_json(output, report.memory);
+  output << ",\n"
+         << "  \"configured_operations\": {\"find\": "
+         << report.configured_operations.find << ", \"insert\": "
+         << report.configured_operations.insert << ", \"update\": "
+         << report.configured_operations.update << ", \"erase\": "
+         << report.configured_operations.erase << ", \"scan\": "
+         << report.configured_operations.scan << ", \"total\": "
+         << report.configured_operations.total << "},\n"
+         << "  \"outcomes\": {\"find_hits\": "
+         << report.outcomes.find_hits << ", \"find_misses\": "
+         << report.outcomes.find_misses << ", \"insert_inserted\": "
+         << report.outcomes.insert_inserted
+         << ", \"insert_already_exists\": "
+         << report.outcomes.insert_already_exists
+         << ", \"update_updated\": " << report.outcomes.update_updated
+         << ", \"update_not_found\": "
+         << report.outcomes.update_not_found << ", \"erase_erased\": "
+         << report.outcomes.erase_erased << ", \"erase_not_found\": "
+         << report.outcomes.erase_not_found << ", \"scan_calls\": "
+         << report.outcomes.scan_calls << ", \"scan_rows\": "
+         << report.outcomes.scan_rows << "},\n"
+         << "  \"state\": {\"initial_key_count\": "
+         << report.initial_key_count << ", \"final_key_count\": ";
+  if (report.final_key_count) {
+    output << *report.final_key_count;
+  } else {
+    output << "null";
+  }
+  output << ", \"touched_keys\": " << report.touched_keys << "},\n"
+         << "  \"samples\": ";
+  write_throughput_samples_json(output, report.samples);
+  output << ",\n  \"latency_samples\": [],\n"
+         << "  \"checksum\": " << report.checksum << "\n}\n";
+  if (!output) {
+    throw std::runtime_error("failed to write mixed result JSON");
+  }
+}
+
 void write_samples_csv(std::ostream& output, const RunReport& report) {
   output << "sample_kind,repeat,sample,query_index,build_ns,lookup_ns,latency_ns,operations,throughput_ops_per_second\n";
   for (const auto& sample : report.samples) {
@@ -1430,31 +2287,51 @@ void write_samples_csv(std::ostream& output, const RunReport& report) {
 
 int run_cli(int argc, char** argv, v1::Factory factory) {
   std::map<std::string, std::string> options;
+  v1::Parameters parameters;
+  std::set<std::string> parameter_names;
   try {
     for (int i = 1; i < argc; ++i) {
       const std::string option = argv[i];
       if (option != "--rows" && option != "--queries" &&
-          option != "--result" && option != "--samples" &&
-          option != "--repeats" && option != "--latency-samples" &&
-          option != "--threads") {
+          option != "--operations" && option != "--result" &&
+          option != "--samples" && option != "--repeats" &&
+          option != "--latency-samples" && option != "--threads" &&
+          option != "--parameter") {
         throw std::invalid_argument("unknown option: " + option);
       }
       if (i + 1 >= argc) {
         throw std::invalid_argument("missing value for " + option);
       }
-      if (!options.emplace(option, argv[++i]).second) {
+      const std::string value = argv[++i];
+      if (option == "--parameter") {
+        auto parameter = parse_parameter_argument(value);
+        if (!parameter_names.insert(parameter.first).second) {
+          throw std::invalid_argument("duplicate parameter name: " +
+                                      parameter.first);
+        }
+        parameters.push_back(std::move(parameter));
+      } else if (!options.emplace(option, value).second) {
         throw std::invalid_argument("duplicate option: " + option);
       }
     }
-    const std::array<const char*, 6> required = {
-        "--rows",   "--queries", "--result",
-        "--samples", "--repeats", "--latency-samples"};
+    const std::array<const char*, 5> required = {
+        "--rows", "--result", "--samples", "--repeats",
+        "--latency-samples"};
     for (const char* option : required) {
       if (options.find(option) == options.end()) {
         throw std::invalid_argument(std::string("missing required option: ") +
                                     option);
       }
     }
+    const bool has_queries = options.find("--queries") != options.end();
+    const bool has_operations =
+        options.find("--operations") != options.end();
+    if (has_queries == has_operations) {
+      throw std::invalid_argument(
+          "exactly one of --queries and --operations is required");
+    }
+    const std::string workload_option =
+        has_queries ? "--queries" : "--operations";
 
     const std::size_t repeats =
         parse_count(options.at("--repeats"), "--repeats", false);
@@ -1467,16 +2344,51 @@ int run_cli(int argc, char** argv, v1::Factory factory) {
     if (threads > 256) {
       throw std::invalid_argument("--threads must be in the range 1..256");
     }
-    preflight_cli_paths(options);
-    RunReport report;
+    preflight_cli_paths(options, workload_option);
+
+    if (has_queries) {
+      RunReport report;
+      report.parameters = parameters;
+      report.execution.threads = threads;
+      report.execution.mode =
+          threads == 1 ? "serial" : "shared-index-read-only";
+      try {
+        const auto rows = read_rows_file(options.at("--rows"));
+        const auto queries = read_queries_file(options.at("--queries"));
+        report = run_static_lookup(factory, parameters, rows, queries, repeats,
+                                   latency_samples, threads);
+      } catch (const std::exception& error) {
+        report.status = "invalid_input";
+        report.stage = "interchange";
+        report.reason = error.what();
+      }
+
+      std::ostringstream result_output;
+      write_result_json(result_output, report);
+      std::ostringstream samples_output;
+      write_samples_csv(samples_output, report);
+      write_exclusive_file(options.at("--result"), result_output.str(),
+                           "result");
+      write_exclusive_file(options.at("--samples"), samples_output.str(),
+                           "samples");
+      return report.status == "passed" || report.status == "skipped" ||
+                     report.status == "unsupported"
+                 ? 0
+                 : 1;
+    }
+
+    MixedRunReport report;
+    report.parameters = parameters;
     report.execution.threads = threads;
     report.execution.mode =
-        threads == 1 ? "serial" : "shared-index-read-only";
+        threads == 1 ? "serial" : "unsupported-mixed-parallel";
     try {
       const auto rows = read_rows_file(options.at("--rows"));
-      const auto queries = read_queries_file(options.at("--queries"));
-      report = run_static_lookup(factory, {}, rows, queries, repeats,
-                                 latency_samples, threads);
+      report.initial_key_count = rows.size();
+      const auto operations =
+          read_operations_file(options.at("--operations"));
+      report = run_mixed_operations(factory, parameters, rows, operations,
+                                    repeats, latency_samples, threads);
     } catch (const std::exception& error) {
       report.status = "invalid_input";
       report.stage = "interchange";
@@ -1484,9 +2396,12 @@ int run_cli(int argc, char** argv, v1::Factory factory) {
     }
 
     std::ostringstream result_output;
-    write_result_json(result_output, report);
+    write_mixed_result_json(result_output, report);
+    RunReport samples_report;
+    samples_report.samples = report.samples;
+    samples_report.latency_samples = report.latency_samples;
     std::ostringstream samples_output;
-    write_samples_csv(samples_output, report);
+    write_samples_csv(samples_output, samples_report);
     write_exclusive_file(options.at("--result"), result_output.str(),
                          "result");
     write_exclusive_file(options.at("--samples"), samples_output.str(),

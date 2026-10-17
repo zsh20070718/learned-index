@@ -1,0 +1,13 @@
+{
+  "schema": "mixed-operations/v1",
+  "seed": 42,
+  "operations": 10000,
+  "initial_load_fraction": "1",
+  "operation_weights": {
+    "scan": "1"
+  },
+  "read_miss_ratio": "0.1",
+  "scan_length": 16,
+  "repeats": 3,
+  "latency_samples": 0
+}

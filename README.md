@@ -4,7 +4,7 @@
 
 项目定位是**数据集与字符串索引实现之间的评测层**：用户指定数据集位置和实现位置，运行统一脚本，得到详细评测结果。数据来源与实现均独立于本项目；我们负责接入、负载、正确性校验、公平测量和结果复现，不自行设计索引算法，也不对用户原始数据设统一键长或字节数上限。
 
-这两侧的规定已写入 [数据接入约定](docs/DATASET_CONTRACT.md) 和 [实现接口契约](docs/INDEX_CONTRACT.md)，实现接口的 C++17 签名在 [index_contract.h](src/index_contract.h)。**统一入口支持单线程与多线程静态点查询**，可接入外部数据和 C++17 适配包，比较均匀、热点、Zipf 访问，并提供独立校验和详细报告。使用方式与当前边界见 [统一入口说明](docs/UNIFIED_BENCHMARK.md)，本周改进见 [2026-10-17 改进记录](docs/WEEKLY_UPDATE_2026-10-17.md)，上一版见 [2026-10-11 记录](docs/WEEKLY_UPDATE_2026-10-11.md)。完整目标见 [评测范围](docs/BENCHMARK.md#产品目标与两侧边界)。
+这两侧的规定已写入 [数据接入约定](docs/DATASET_CONTRACT.md) 和 [实现接口契约](docs/INDEX_CONTRACT.md)，实现接口的 C++17 签名在 [index_contract.h](src/index_contract.h)。**统一入口支持静态点查询、共享实例的并发读取，以及单线程增删改查与扫描混合负载**，可接入外部数据和 C++17 适配包，比较均匀、热点、Zipf 访问，并提供独立校验和详细报告。使用方式与当前边界见 [统一入口说明](docs/UNIFIED_BENCHMARK.md)，本周改进见 [2026-10-17 改进记录](docs/WEEKLY_UPDATE_2026-10-17.md)，上一版见 [2026-10-11 记录](docs/WEEKLY_UPDATE_2026-10-11.md)。完整目标见 [评测范围](docs/BENCHMARK.md#产品目标与两侧边界)。
 
 ## 快速开始：统一入口
 
@@ -38,9 +38,26 @@ python3 -B scripts/benchmark.py \
 
 每轮总操作数固定，各线程均分查询；每个适配器只编译一次，各配置依次运行。两个自带基线已声明并发读取能力，外部实现需显式设置 `concurrent_find = true`；未声明的实现仍能单线程运行，并行组合记为 `unsupported`。`--threads` 控制查询线程，`--jobs` 控制编译并行度。
 
-`report.md`、`summary.csv` 和新增的 `scaling.csv` 给出吞吐量、相对单线程的加速比和并行效率；`workers.csv` 保留逐线程操作数与计时。延迟来自独立单线程抽样，不代表并发尾延迟。本次支持静态并发读取，写入与读写混合语义另行接入。完整口径、接入例子和限制见 [并行评测说明](docs/PARALLEL_BENCHMARK.md)。
+`report.md`、`summary.csv` 和新增的 `scaling.csv` 给出吞吐量、相对单线程的加速比和并行效率；`workers.csv` 保留逐线程操作数与计时。延迟来自独立单线程抽样，不代表并发尾延迟。并发实验采用静态读取；单线程写入和扫描另见下方混合场景。完整口径、接入例子和限制见 [并行评测说明](docs/PARALLEL_BENCHMARK.md)。
 
 两个同学的现有模型适配包也已完成固定版本的静态查询接入实测，接入方式与并发边界见 [同学实现接入说明](docs/TEAMMATE_INTEGRATION.md)；源码核对见 [兼容性报告](docs/TEAMMATE_COMPATIBILITY_2026-10-17.md)。三类真实键 × 三种访问分布的基线扩展性结果保留在 [结果 CSV](docs/experiments/parallel-read-2026-10-17.csv)。
+
+## 混合读写、扫描与模型参数
+
+用同一入口选择 `mixed-all.json`，即可依次评测查询、插入、更新、删除和扫描：
+
+```bash
+python3 -B scripts/benchmark.py \
+  --dataset examples/keys.txt \
+  --implementation adapters/std_map \
+  --implementation adapters/sorted_vector \
+  --workload examples/workloads/mixed-all.json \
+  --output results/mixed-all
+```
+
+另有读插、更新删除、带扫描读插和纯扫描四份配置。操作先经独立参照逐项校验，并检查写后读回及最终状态，再从相同初始状态重复测量。std-map 支持全部五种操作，sorted-vector 支持静态查询和扫描；不支持的组合保留状态。动态混合目前按单线程执行。
+
+`--parameter 实现ID:参数名=值` 可重复传递外部适配器已有的模型参数，静态和混合场景均适用；参数随结果记录。完整配置、计时口径与同学模型能力见 [混合评测说明](docs/MIXED_BENCHMARK.md)。三类真实键及字节边界数据的 [80 个混合组合](docs/experiments/mixed-operations-2026-10-17.csv) 已完成实测，各自能力范围内通过。
 
 ## 旧 TLI 开发入口
 
@@ -137,10 +154,10 @@ python3 -B scripts/make_dataset.py data/sample_string --input /path/to/strings.t
 
 | 路径 | 用途 |
 | --- | --- |
-| `scripts/benchmark.py` | 统一静态点查询入口：数据读取、适配构建、校验、测量与报告 |
+| `scripts/benchmark.py` | 统一评测入口：数据读取、静态/混合负载、校验、测量与报告 |
 | `src/unified/` | 使用 v1 接口的独立 C++17 评测程序 |
 | `adapters/` | map 与排序数组的示例适配包 |
-| `examples/workloads/` | 统一入口的均匀、热点、Zipf 场景配置 |
+| `examples/workloads/` | 静态均匀/热点/Zipf、多线程读取及五类混合场景配置 |
 | `docs/UNIFIED_BENCHMARK.md` | 统一入口使用说明与覆盖边界 |
 | `src/string_benchmark.cpp` | TLI 字符串执行入口，索引选择与错误返回 |
 | `src/std_map.h` | 与 TLI 接口兼容的对照索引 |

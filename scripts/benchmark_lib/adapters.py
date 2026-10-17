@@ -9,7 +9,7 @@ import struct
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .errors import BuildFailure, InputError, RunFailure
 
@@ -18,6 +18,8 @@ MANIFEST_NAME = "benchmark-adapter.json"
 CONTRACT = "string-index/v1"
 RUN_SCHEMA = "string-index-static-run/v1"
 PARALLEL_RUN_SCHEMA = "string-index-static-run/v2"
+CURRENT_RUN_SCHEMA = "string-index-static-run/v3"
+MIXED_RUN_SCHEMA = "string-index-mixed-run/v1"
 RUN_STATUSES = {"passed", "skipped", "unsupported", "invalid_input", "failed"}
 SUCCESS_STATUSES = {"passed", "skipped", "unsupported"}
 FAILURE_STATUSES = {"invalid_input", "failed"}
@@ -37,6 +39,7 @@ _TARGET = re.compile(
 )
 _SYMBOL = re.compile(r"^(?:::)?[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$")
 _HEADER_PART = re.compile(r"^[A-Za-z0-9_.+-]+$")
+_PARAMETER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 
 
 def _object_without_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
@@ -120,11 +123,23 @@ def initial_build_identity(
             is_directory = False
         manifest_path = requested_path / MANIFEST_NAME if is_directory else requested_path
         declared_identity = None
+    runner_sources = {}  # type: Dict[str, Optional[str]]
+    unified = repository_root / "src/unified"
+    try:
+        paths = sorted(
+            path for path in unified.iterdir()
+            if path.is_file() and path.suffix in (".cpp", ".cc", ".cxx", ".h", ".hpp")
+        )
+    except OSError:
+        paths = []
+    for path in paths:
+        runner_sources[path.relative_to(repository_root).as_posix()] = _sha256_file(path)
     return {
         "schema": "string-index-build-identity/v1",
         "adapter_manifest_sha256": _sha256_file(manifest_path),
         "runner_harness_sha256": _sha256_file(repository_root / "src/unified/runner.cpp"),
         "runner_header_sha256": _sha256_file(repository_root / "src/unified/runner.h"),
+        "runner_sources_sha256": runner_sources,
         "index_contract_sha256": _sha256_file(repository_root / "src/index_contract.h"),
         "adapter_declared_source_identity": declared_identity,
         "external_source_git": _source_git_identity(manifest.source_dir) if manifest else None,
@@ -278,7 +293,8 @@ def _cmake_bracket(value: str) -> str:
 
 def cmake_project(manifest: AdapterManifest, repository_root: Path) -> str:
     source = _cmake_bracket(str(manifest.source_dir))
-    runner = _cmake_bracket(str(repository_root / "src/unified/runner.cpp"))
+    runner_sources = sorted((repository_root / "src/unified").glob("*.cpp"))
+    runner = " ".join(_cmake_bracket(str(path)) for path in runner_sources)
     include = _cmake_bracket(str(repository_root / "src"))
     return """cmake_minimum_required(VERSION 3.16)
 project(string_index_static_adapter LANGUAGES CXX)
@@ -433,6 +449,45 @@ def _finite_positive(value: Any, location: str) -> float:
     return result
 
 
+def _validate_parameter_pairs(parameters: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    result = []  # type: List[Tuple[str, str]]
+    seen = set()
+    for item in parameters:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise RunFailure("runner parameters are malformed")
+        name, value = item
+        if not isinstance(name, str) or _PARAMETER_NAME.fullmatch(name) is None:
+            raise RunFailure("runner parameter name is malformed")
+        if not isinstance(value, str):
+            raise RunFailure("runner parameter value is malformed")
+        if name in seen:
+            raise RunFailure("runner parameter name is duplicated")
+        seen.add(name)
+        result.append((name, value))
+    return result
+
+
+def _validate_parameters(value: Any, expected: Sequence[Tuple[str, str]]) -> None:
+    if not isinstance(value, list):
+        raise RunFailure("runner result parameters must be an array")
+    actual = []  # type: List[Tuple[str, str]]
+    seen = set()
+    for item in value:
+        parameter = _exact_object(item, {"name", "value"}, "parameter")
+        name, parameter_value = parameter["name"], parameter["value"]
+        if (
+            not isinstance(name, str)
+            or _PARAMETER_NAME.fullmatch(name) is None
+            or not isinstance(parameter_value, str)
+            or name in seen
+        ):
+            raise RunFailure("runner result has malformed parameters")
+        seen.add(name)
+        actual.append((name, parameter_value))
+    if actual != list(expected):
+        raise RunFailure("runner result parameters do not match the invocation")
+
+
 def _validate_descriptor(value: Any, completed: bool, parallel_schema: bool = False) -> None:
     if value is None:
         if completed:
@@ -502,17 +557,17 @@ def _validate_descriptor(value: Any, completed: bool, parallel_schema: bool = Fa
         if not isinstance(capabilities[name], str):
             raise RunFailure("runner result descriptor support has an invalid type")
         supports.append(capabilities[name])
+    if any(value not in SUPPORT_VALUES for value in supports):
+        raise RunFailure("runner result has invalid support evidence")
+    if maximum is not None and minimum > maximum:
+        raise RunFailure("runner result has an invalid key domain")
+    if fixed is not None and (fixed < minimum or (maximum is not None and fixed > maximum)):
+        raise RunFailure("runner result has an invalid fixed key domain")
+    if "adapted" in supports and not descriptor["adaptation_notes"]:
+        raise RunFailure("runner result lacks adaptation notes")
     if completed:
-        if any(value not in SUPPORT_VALUES for value in supports):
-            raise RunFailure("passed runner result has invalid support evidence")
         if capabilities["bulk_load"] == "unsupported" or capabilities["find"] == "unsupported":
             raise RunFailure("passed runner result lacks required capabilities")
-        if maximum is not None and minimum > maximum:
-            raise RunFailure("passed runner result has an invalid key domain")
-        if fixed is not None and (fixed < minimum or (maximum is not None and fixed > maximum)):
-            raise RunFailure("passed runner result has an invalid fixed key domain")
-        if "adapted" in supports and not descriptor["adaptation_notes"]:
-            raise RunFailure("passed runner result lacks adaptation notes")
 
 
 def _validate_memory(value: Any, completed: bool) -> None:
@@ -536,7 +591,7 @@ def _validate_memory(value: Any, completed: bool) -> None:
         raise RunFailure("runner result memory evidence has invalid accounting notes")
 
 
-def parse_runner_result(
+def _parse_static_runner_result(
     path: Path,
     expected_repeats: Optional[int] = None,
     expected_operations: Optional[int] = None,
@@ -544,6 +599,7 @@ def parse_runner_result(
     expected_rows: Optional[int] = None,
     returncode: Optional[int] = None,
     expected_threads: int = 1,
+    expected_parameters: Sequence[Tuple[str, str]] = (),
 ) -> Dict[str, Any]:
     try:
         raw = json.loads(
@@ -553,10 +609,13 @@ def parse_runner_result(
         )
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         raise RunFailure("runner result is missing or malformed")
-    parallel_schema = isinstance(raw, dict) and raw.get("schema") == PARALLEL_RUN_SCHEMA
+    schema = raw.get("schema") if isinstance(raw, dict) else None
+    parallel_schema = schema in (PARALLEL_RUN_SCHEMA, CURRENT_RUN_SCHEMA)
+    parameter_schema = schema == CURRENT_RUN_SCHEMA
     raw = _exact_object(
         raw,
-        ({"execution"} if parallel_schema else set()) | {
+        ({"execution"} if parallel_schema else set())
+        | ({"parameters"} if parameter_schema else set()) | {
             "schema",
             "status",
             "stage",
@@ -570,8 +629,12 @@ def parse_runner_result(
         },
         "top-level object",
     )
-    if raw["schema"] not in (RUN_SCHEMA, PARALLEL_RUN_SCHEMA):
+    if raw["schema"] not in (RUN_SCHEMA, PARALLEL_RUN_SCHEMA, CURRENT_RUN_SCHEMA):
         raise RunFailure("runner result has an unsupported schema")
+    if parameter_schema:
+        _validate_parameters(raw["parameters"], expected_parameters)
+    elif expected_parameters:
+        raise RunFailure("historical runner result cannot certify parameters")
     if parallel_schema:
         execution = _exact_object(
             raw["execution"], {"threads", "mode", "partition", "latency_mode"}, "execution"
@@ -750,6 +813,207 @@ def parse_runner_result(
     return raw
 
 
+def _parse_mixed_runner_result(
+    path: Path,
+    expected_repeats: Optional[int] = None,
+    expected_operations: Optional[int] = None,
+    expected_latency_samples: Optional[int] = None,
+    expected_rows: Optional[int] = None,
+    returncode: Optional[int] = None,
+    expected_threads: int = 1,
+    expected_parameters: Sequence[Tuple[str, str]] = (),
+) -> Dict[str, Any]:
+    try:
+        raw = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_object_without_duplicates,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        raise RunFailure("runner result is missing or malformed")
+    raw = _exact_object(raw, {
+        "schema", "status", "stage", "reason", "parameters", "execution",
+        "descriptor", "validation", "memory", "configured_operations", "outcomes",
+        "state", "samples", "latency_samples", "checksum",
+    }, "top-level object")
+    if raw["schema"] != MIXED_RUN_SCHEMA:
+        raise RunFailure("runner result has an unsupported schema")
+    _validate_parameters(raw["parameters"], expected_parameters)
+
+    status = raw["status"]
+    if not isinstance(status, str) or status not in RUN_STATUSES:
+        raise RunFailure("runner result has an invalid status")
+    if not isinstance(raw["stage"], str) or not raw["stage"]:
+        raise RunFailure("runner result stage has an invalid type")
+    if not isinstance(raw["reason"], str):
+        raise RunFailure("runner result reason has an invalid type")
+    completed = status == "passed"
+    if completed and (raw["stage"] != "complete" or raw["reason"]):
+        raise RunFailure("passed runner result has inconsistent completion fields")
+    if not completed and not raw["reason"]:
+        raise RunFailure("non-passed runner result is missing a reason")
+    if returncode is not None:
+        expected_statuses = SUCCESS_STATUSES if returncode == 0 else FAILURE_STATUSES
+        if returncode not in (0, 1) or status not in expected_statuses:
+            raise RunFailure("runner exit code and structured status are inconsistent")
+
+    execution = _exact_object(
+        raw["execution"], {"threads", "mode", "partition", "latency_mode"}, "execution"
+    )
+    threads = _uint(execution["threads"], "execution threads", positive=True)
+    expected_mode = "serial" if threads == 1 else "unsupported-mixed-parallel"
+    if (
+        threads != expected_threads
+        or threads > 256
+        or execution["mode"] != expected_mode
+        or execution["partition"] != "serial-trace"
+        or execution["latency_mode"] != "disabled"
+    ):
+        raise RunFailure("runner result has inconsistent mixed execution semantics")
+    if completed and threads != 1:
+        raise RunFailure("passed mixed result claims parallel execution")
+
+    _validate_descriptor(raw["descriptor"], completed, parallel_schema=True)
+    _validate_memory(raw["memory"], completed)
+    validation = _exact_object(raw["validation"], {
+        "descriptor_checked", "capability_domain_checked", "empty_build_checked",
+        "represented_boundaries_checked", "trace_replay_checked", "affected_keys_checked",
+        "final_state_checked", "initial_rows_checked", "operations_checked",
+        "touched_keys_checked",
+    }, "validation evidence")
+    flag_names = (
+        "descriptor_checked", "capability_domain_checked", "empty_build_checked",
+        "represented_boundaries_checked", "trace_replay_checked", "affected_keys_checked",
+        "final_state_checked",
+    )
+    for name in flag_names:
+        if not isinstance(validation[name], bool):
+            raise RunFailure("runner result validation evidence has an invalid flag")
+    initial_rows_checked = _uint(validation["initial_rows_checked"], "initial_rows_checked")
+    operations_checked = _uint(validation["operations_checked"], "operations_checked")
+    touched_keys_checked = _uint(validation["touched_keys_checked"], "touched_keys_checked")
+
+    configured = _exact_object(
+        raw["configured_operations"], {"find", "insert", "update", "erase", "scan", "total"},
+        "configured operations",
+    )
+    configured_values = {
+        name: _uint(configured[name], "configured operation {}".format(name))
+        for name in ("find", "insert", "update", "erase", "scan", "total")
+    }
+    if sum(configured_values[name] for name in ("find", "insert", "update", "erase", "scan")) != configured_values["total"]:
+        raise RunFailure("runner result has inconsistent configured operation counts")
+    if expected_operations is not None and configured_values["total"] != expected_operations:
+        raise RunFailure("runner result has an incorrect configured operation count")
+
+    outcome_names = (
+        "find_hits", "find_misses", "insert_inserted", "insert_already_exists",
+        "update_updated", "update_not_found", "erase_erased", "erase_not_found",
+        "scan_calls", "scan_rows",
+    )
+    outcomes = _exact_object(raw["outcomes"], set(outcome_names), "outcomes")
+    outcome_values = {name: _uint(outcomes[name], "outcome {}".format(name)) for name in outcome_names}
+    state = _exact_object(
+        raw["state"], {"initial_key_count", "final_key_count", "touched_keys"}, "state"
+    )
+    initial_key_count = _uint(state["initial_key_count"], "initial key count")
+    final_key_count = _optional_uint(state["final_key_count"], "final key count")
+    touched_keys = _uint(state["touched_keys"], "touched keys")
+    if not isinstance(raw["samples"], list) or not isinstance(raw["latency_samples"], list):
+        raise RunFailure("runner result measurement fields must be arrays")
+    checksum = _uint(raw["checksum"], "checksum")
+    if expected_rows is not None and initial_key_count != expected_rows:
+        raise RunFailure("runner result has an incorrect initial key count")
+
+    if not completed:
+        if raw["samples"] or raw["latency_samples"] or checksum != 0:
+            raise RunFailure("non-passed runner result carries completed measurements")
+        if any(outcome_values.values()) or final_key_count is not None:
+            raise RunFailure("non-passed runner result carries fabricated mixed outcomes")
+        return raw
+
+    if None in (expected_repeats, expected_operations, expected_latency_samples, expected_rows):
+        raise RunFailure("passed runner result cannot be validated without expected run context")
+    assert expected_repeats is not None
+    assert expected_operations is not None
+    assert expected_latency_samples is not None
+    assert expected_rows is not None
+    if expected_latency_samples != 0 or raw["latency_samples"]:
+        raise RunFailure("mixed runner result carries latency measurements")
+    if not all(validation[name] for name in flag_names):
+        raise RunFailure("passed runner result has incomplete validation evidence")
+    if (
+        initial_rows_checked != expected_rows
+        or operations_checked != expected_operations
+        or initial_key_count != expected_rows
+        or touched_keys_checked != touched_keys
+    ):
+        raise RunFailure("passed runner result has incorrect validation counts")
+    if (
+        outcome_values["find_hits"] + outcome_values["find_misses"] != configured_values["find"]
+        or outcome_values["insert_inserted"] + outcome_values["insert_already_exists"] != configured_values["insert"]
+        or outcome_values["update_updated"] + outcome_values["update_not_found"] != configured_values["update"]
+        or outcome_values["erase_erased"] + outcome_values["erase_not_found"] != configured_values["erase"]
+        or outcome_values["scan_calls"] != configured_values["scan"]
+    ):
+        raise RunFailure("passed runner result has fabricated mixed outcome counts")
+    expected_final = initial_key_count + outcome_values["insert_inserted"] - outcome_values["erase_erased"]
+    if final_key_count != expected_final:
+        raise RunFailure("passed runner result has an inconsistent final key count")
+    if len(raw["samples"]) != expected_repeats:
+        raise RunFailure("passed runner result has an incorrect repeat count")
+    for repeat, sample_value in enumerate(raw["samples"]):
+        sample = _exact_object(sample_value, {
+            "repeat", "build_ns", "latency_build_ns", "lookup_ns", "operations",
+            "throughput_ops_per_second", "workers",
+        }, "throughput sample")
+        if _uint(sample["repeat"], "sample repeat") != repeat:
+            raise RunFailure("passed runner result has an incorrect repeat index")
+        _uint(sample["build_ns"], "sample build_ns")
+        if sample["latency_build_ns"] is not None:
+            raise RunFailure("mixed runner result carries a fabricated latency build")
+        lookup_ns = _uint(sample["lookup_ns"], "sample lookup_ns", positive=True)
+        operations = _uint(sample["operations"], "sample operations", positive=True)
+        if operations != expected_operations:
+            raise RunFailure("passed runner result has an incorrect operation count")
+        throughput = _finite_positive(sample["throughput_ops_per_second"], "sample throughput")
+        if not math.isclose(throughput, operations * 1.0e9 / lookup_ns, rel_tol=1e-12, abs_tol=0.0):
+            raise RunFailure("passed runner result has inconsistent throughput")
+        workers = sample["workers"]
+        if not isinstance(workers, list) or len(workers) != 1:
+            raise RunFailure("passed mixed result has an incorrect worker count")
+        worker = _exact_object(workers[0], {"worker", "operations", "lookup_ns", "checksum"}, "worker")
+        if (
+            _uint(worker["worker"], "worker index") != 0
+            or _uint(worker["operations"], "worker operations", positive=True) != expected_operations
+            or _uint(worker["lookup_ns"], "worker lookup_ns") > lookup_ns
+        ):
+            raise RunFailure("passed mixed result has inconsistent worker evidence")
+        _uint(worker["checksum"], "worker checksum")
+    return raw
+
+
+def parse_runner_result(
+    path: Path,
+    expected_repeats: Optional[int] = None,
+    expected_operations: Optional[int] = None,
+    expected_latency_samples: Optional[int] = None,
+    expected_rows: Optional[int] = None,
+    returncode: Optional[int] = None,
+    expected_threads: int = 1,
+    expected_parameters: Sequence[Tuple[str, str]] = (),
+) -> Dict[str, Any]:
+    try:
+        schema = json.loads(path.read_text(encoding="utf-8")).get("schema")
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        schema = None
+    parser = _parse_mixed_runner_result if schema == MIXED_RUN_SCHEMA else _parse_static_runner_result
+    return parser(
+        path, expected_repeats, expected_operations, expected_latency_samples,
+        expected_rows, returncode, expected_threads, expected_parameters,
+    )
+
+
 def _interchange_count(path: Path, expected_magic: bytes, kind: str) -> int:
     try:
         with path.open("rb") as stream:
@@ -764,16 +1028,21 @@ def _interchange_count(path: Path, expected_magic: bytes, kind: str) -> int:
 def invoke_runner(
     executable: Path,
     rows_path: Path,
-    queries_path: Path,
+    workload_path: Path,
     run_dir: Path,
     repeats: int,
     latency_samples: int,
     run_timeout: int,
     threads: int = 1,
+    parameters: Sequence[Tuple[str, str]] = (),
+    mixed: bool = False,
 ) -> Dict[str, Any]:
+    parameter_pairs = _validate_parameter_pairs(parameters)
     expected_rows = _interchange_count(rows_path, b"SIBROW1\0", "rows")
     expected_operations = _interchange_count(
-        queries_path, b"SIBQRY1\0", "queries"
+        workload_path,
+        b"SIBOPS1\0" if mixed else b"SIBQRY1\0",
+        "operations" if mixed else "queries",
     )
     run_dir.mkdir(parents=True, exist_ok=False)
     result_path = run_dir / "result.json"
@@ -782,8 +1051,8 @@ def invoke_runner(
         str(executable),
         "--rows",
         str(rows_path),
-        "--queries",
-        str(queries_path),
+        "--operations" if mixed else "--queries",
+        str(workload_path),
         "--result",
         str(result_path),
         "--samples",
@@ -795,6 +1064,8 @@ def invoke_runner(
         "--threads",
         str(threads),
     ]
+    for name, value in parameter_pairs:
+        command.extend(["--parameter", "{}={}".format(name, value)])
     try:
         completed = subprocess.run(
             command,
@@ -819,4 +1090,5 @@ def invoke_runner(
         expected_rows=expected_rows,
         returncode=completed.returncode,
         expected_threads=threads,
+        expected_parameters=parameter_pairs,
     )

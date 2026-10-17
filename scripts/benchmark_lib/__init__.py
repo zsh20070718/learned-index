@@ -4,16 +4,26 @@ from .adapters import AdapterManifest, load_manifest, parse_runner_result
 from .dataset import PreparedDataset, logical_hash, prepare_dataset
 from .errors import BenchmarkError, InputError, ResourceBudget
 from .readers import iter_keys, resolve_reader
-from .workload import WorkloadConfig, generate_queries, load_workload
+from .workload import (
+    MixedWorkloadConfig,
+    PreparedMixedWorkload,
+    WorkloadConfig,
+    generate_mixed_operations,
+    generate_queries,
+    load_workload,
+)
 
 __all__ = [
     "AdapterManifest",
     "BenchmarkError",
     "InputError",
     "PreparedDataset",
+    "PreparedMixedWorkload",
     "ResourceBudget",
+    "MixedWorkloadConfig",
     "WorkloadConfig",
     "generate_queries",
+    "generate_mixed_operations",
     "iter_keys",
     "load_manifest",
     "load_workload",

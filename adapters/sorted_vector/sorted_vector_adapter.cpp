@@ -39,10 +39,11 @@ class SortedVectorIndex final : public string_index_bench::v1::Index {
     string_index_bench::v1::Descriptor descriptor;
     descriptor.implementation = "sorted vector binary search";
     descriptor.implementation_version = "builtin-v1";
-    descriptor.adapter_version = "builtin-sorted-vector-v1";
+    descriptor.adapter_version = "builtin-sorted-vector-v2";
     descriptor.capabilities.bulk_load =
         string_index_bench::v1::Support::native;
     descriptor.capabilities.find = string_index_bench::v1::Support::native;
+    descriptor.capabilities.scan = string_index_bench::v1::Support::native;
     descriptor.capabilities.concurrent_find = true;
     return descriptor;
   }
@@ -91,9 +92,18 @@ class SortedVectorIndex final : public string_index_bench::v1::Index {
     throw string_index_bench::v1::UnsupportedOperation("erase unsupported");
   }
 
-  std::vector<string_index_bench::v1::Row> scan(std::string_view,
-                                                 std::size_t) const override {
-    throw string_index_bench::v1::UnsupportedOperation("scan unsupported");
+  std::vector<string_index_bench::v1::Row> scan(
+      std::string_view lower_bound, std::size_t limit) const override {
+    require_loaded();
+    const auto first = std::lower_bound(
+        rows_.begin(), rows_.end(), lower_bound,
+        [](const string_index_bench::v1::Row& row, std::string_view candidate) {
+          return UnsignedByteLess{}(row.key, candidate);
+        });
+    const std::size_t available =
+        static_cast<std::size_t>(rows_.end() - first);
+    const std::size_t count = std::min(limit, available);
+    return std::vector<string_index_bench::v1::Row>(first, first + count);
   }
 
   string_index_bench::v1::Value range_sum(std::string_view,

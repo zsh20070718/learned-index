@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import io
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -23,6 +24,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import benchmark  # noqa: E402
 import benchmark_lib.dataset as dataset_module  # noqa: E402
 from benchmark_lib.adapters import (  # noqa: E402
+    CURRENT_RUN_SCHEMA,
+    MIXED_RUN_SCHEMA,
     RUN_SCHEMA,
     PARALLEL_RUN_SCHEMA,
     initial_build_identity,
@@ -39,17 +42,22 @@ from benchmark_lib.dataset import (  # noqa: E402
 )
 from benchmark_lib.errors import BuildFailure, InputError, ResourceBudget, RunFailure  # noqa: E402
 from benchmark_lib.interchange import (  # noqa: E402
+    OPERATIONS_MAGIC,
     QUERIES_MAGIC,
     ROWS_MAGIC,
     write_queries,
     write_rows,
+    write_operations,
 )
 from benchmark_lib.readers import iter_keys  # noqa: E402
 from benchmark_lib.reports import SUMMARY_FIELDS, scaling_summaries, summary_row, write_reports  # noqa: E402
 from benchmark_lib.workload import (  # noqa: E402
+    MIXED_SCHEMA,
     POINT_SCHEMA,
     SCHEMA,
+    MixedWorkloadConfig,
     WorkloadConfig,
+    generate_mixed_operations,
     generate_queries,
     load_workload,
 )
@@ -196,6 +204,70 @@ def parallel_runner_payload(threads: int = 2, operations: int = 3) -> dict:
             for worker in range(threads)
         ]
     return payload
+
+
+def mixed_runner_payload(repeats: int = 2) -> dict:
+    operations = 5
+    descriptor = runner_descriptor()
+    descriptor["capabilities"]["concurrent_find"] = False
+    return {
+        "schema": MIXED_RUN_SCHEMA,
+        "status": "passed",
+        "stage": "complete",
+        "reason": "",
+        "parameters": [{"name": "mode", "value": "exact=value"}],
+        "execution": {
+            "threads": 1,
+            "mode": "serial",
+            "partition": "serial-trace",
+            "latency_mode": "disabled",
+        },
+        "descriptor": descriptor,
+        "validation": {
+            "descriptor_checked": True,
+            "capability_domain_checked": True,
+            "empty_build_checked": True,
+            "represented_boundaries_checked": True,
+            "trace_replay_checked": True,
+            "affected_keys_checked": True,
+            "final_state_checked": True,
+            "initial_rows_checked": 2,
+            "operations_checked": operations,
+            "touched_keys_checked": 4,
+        },
+        "memory": {
+            "index_owned_bytes": None,
+            "adapter_owned_bytes": None,
+            "retained_input_bytes": None,
+            "accounting_notes": "fixture accounting",
+        },
+        "configured_operations": {
+            "find": 1, "insert": 1, "update": 1, "erase": 1, "scan": 1,
+            "total": operations,
+        },
+        "outcomes": {
+            "find_hits": 1, "find_misses": 0,
+            "insert_inserted": 1, "insert_already_exists": 0,
+            "update_updated": 1, "update_not_found": 0,
+            "erase_erased": 1, "erase_not_found": 0,
+            "scan_calls": 1, "scan_rows": 2,
+        },
+        "state": {"initial_key_count": 2, "final_key_count": 2, "touched_keys": 4},
+        "samples": [
+            {
+                "repeat": repeat,
+                "build_ns": 4,
+                "latency_build_ns": None,
+                "lookup_ns": 10,
+                "operations": operations,
+                "throughput_ops_per_second": operations * 1.0e9 / 10,
+                "workers": [{"worker": 0, "operations": operations, "lookup_ns": 8, "checksum": repeat}],
+            }
+            for repeat in range(repeats)
+        ],
+        "latency_samples": [],
+        "checksum": 7,
+    }
 
 
 class ParallelBoundaryTests(unittest.TestCase):
@@ -1202,6 +1274,280 @@ class CliTests(unittest.TestCase):
             result = json.loads((output / "report.json").read_text(encoding="utf-8"))["results"][0]
             self.assertEqual((result["status"], result["stage"]), ("invalid_input", "manifest"))
             self.assertNotIn("private-key", result["reason"])
+
+
+class MixedWorkloadAndBoundaryTests(unittest.TestCase):
+    def _mixed_config(self, **changes) -> MixedWorkloadConfig:
+        values = {
+            "seed": 19,
+            "operations": 50,
+            "initial_load_fraction": Fraction(1, 2),
+            "operation_weights": {name: Fraction(1, 5) for name in (
+                "find", "insert", "update", "erase", "scan"
+            )},
+            "read_miss_ratio": Fraction(1, 2),
+            "scan_length": 3,
+            "repeats": 2,
+            "latency_samples": 0,
+        }
+        values.update(changes)
+        return MixedWorkloadConfig(**values)
+
+    def test_mixed_schema_exact_decimals_largest_remainder_and_rejections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "mixed.json"
+            path.write_text(json.dumps({
+                "schema": MIXED_SCHEMA,
+                "operations": 7,
+                "initial_load_fraction": "0.33333333333333333333333333333333",
+                "operation_weights": {
+                    "find": "0.2", "insert": "0.2", "update": "0.2",
+                    "erase": "0.2", "scan": "0.2",
+                },
+                "read_miss_ratio": "0.29",
+                "scan_length": 0,
+            }), encoding="utf-8")
+            config = load_workload(path)
+            self.assertIsInstance(config, MixedWorkloadConfig)
+            self.assertEqual(config.configured_counts(), {
+                "find": 2, "insert": 2, "update": 1, "erase": 1, "scan": 1, "total": 7,
+            })
+            self.assertEqual(config.initial_load_fraction, Fraction("0.33333333333333333333333333333333"))
+            for mutation in (
+                {"latency_samples": 1},
+                {"distribution": "uniform"},
+                {"operation_weights": {"find": "0.9"}},
+                {"operation_weights": {"find": "1", "unknown": "0"}},
+            ):
+                raw = {"schema": MIXED_SCHEMA}
+                raw.update(mutation)
+                path.write_text(json.dumps(raw), encoding="utf-8")
+                with self.assertRaises(InputError):
+                    load_workload(path)
+
+    def test_mixed_generation_is_deterministic_bounded_and_exercises_branches(self) -> None:
+        keys = [b"", b"a", b"a\0", b"prefix", b"prefix-more", b"\x80", b"\xff"]
+        config = self._mixed_config()
+        first = generate_mixed_operations(keys, config, 4 * 1024 * 1024)
+        second = generate_mixed_operations(keys, config, 4 * 1024 * 1024)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first.operations), 50)
+        self.assertEqual(first.metadata["configured_operations"]["total"], 50)
+        self.assertEqual(sum(first.metadata["actual_result_counts"][name] for name in (
+            "find_hits", "find_misses"
+        )), first.metadata["configured_operations"]["find"])
+        self.assertEqual(first.metadata["fixture_attempts"], {
+            "intentional_duplicate_inserts": 1,
+            "intentional_missing_updates": 1,
+            "intentional_missing_erases": 1,
+        })
+        self.assertLessEqual(first.metadata["peak_live_key_count"], len(keys) + 50)
+        self.assertLessEqual(first.metadata["peak_absent_key_count"], len(keys) + 50)
+        values = [value for kind, _key, value, _limit in first.operations if kind in (2, 3)]
+        self.assertEqual(values[:2], [0, (1 << 64) - 1])
+        self.assertEqual(first.metadata["trace_value_policy"], {
+            "scope": "insert/update payloads only; unrelated to initial ranks",
+            "stream": "operation-values",
+            "sequence": "first generated value 0; second UINT64_MAX; remaining values seeded uint64",
+            "update_collision": (
+                "replace an unchanged candidate with UINT64_MAX, or 0 when previous is UINT64_MAX"
+            ),
+        })
+        with self.assertRaises(ResourceBudget):
+            generate_mixed_operations(keys, config, 100)
+
+    def test_noncontiguous_initial_subset_preserves_full_source_ranks(self) -> None:
+        keys = [b"a", b"b", b"c", b"d", b"e", b"f"]
+        prepared = generate_mixed_operations(
+            keys, self._mixed_config(seed=3, operations=5), 1024 * 1024
+        )
+        self.assertEqual(prepared.initial_keys, [keys[index] for index in prepared.initial_values])
+        self.assertNotEqual(prepared.initial_values, list(range(len(prepared.initial_values))))
+        self.assertEqual(prepared.metadata["initial_value_policy"], "full-sorted-unique-source-rank")
+        digest = hashlib.sha256()
+        for key, value in zip(prepared.initial_keys, prepared.initial_values):
+            digest.update(struct.pack("<Q", len(key)) + key + struct.pack("<Q", value))
+        self.assertEqual(prepared.metadata["initial_content_sha256"], digest.hexdigest())
+        with tempfile.TemporaryDirectory() as temp:
+            rows = Path(temp) / "rows.bin"
+            write_rows(rows, prepared.initial_keys, prepared.initial_values)
+            raw = rows.read_bytes()
+            offset = 16
+            observed = []
+            for _ in prepared.initial_keys:
+                length, = struct.unpack_from("<Q", raw, offset)
+                offset += 8
+                key = raw[offset:offset + length]
+                offset += length
+                value, = struct.unpack_from("<Q", raw, offset)
+                offset += 8
+                observed.append((key, value))
+            self.assertEqual(observed, list(zip(prepared.initial_keys, prepared.initial_values)))
+            with self.assertRaises(ValueError):
+                write_rows(Path(temp) / "bad-length.bin", [b"a"], [])
+            with self.assertRaises(ValueError):
+                write_rows(Path(temp) / "bad-value.bin", [b"a"], [True])
+
+    def test_insert_attempt_provenance_includes_original_and_synthetic_duplicates(self) -> None:
+        for keys in ([b"original"], []):
+            with self.subTest(keys=keys):
+                config = self._mixed_config(
+                    operations=4, initial_load_fraction=Fraction(1),
+                    operation_weights={"insert": Fraction(1)},
+                )
+                prepared = generate_mixed_operations(keys, config, 1024 * 1024)
+                original_attempts = sum(key in keys for _kind, key, _value, _limit in prepared.operations)
+                self.assertEqual(prepared.metadata["insert_attempts"], {
+                    "original": original_attempts, "synthetic": 4 - original_attempts,
+                })
+                self.assertEqual(sum(prepared.metadata["insert_attempts"].values()), 4)
+                self.assertEqual(prepared.metadata["actual_result_counts"]["insert_already_exists"], 1)
+                self.assertEqual(prepared.metadata["original_insert_attempts"], original_attempts)
+                self.assertEqual(prepared.metadata["synthetic_insert_attempts"], 4 - original_attempts)
+
+    def test_mixed_markdown_describes_serial_latency_disabled_measurement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            write_reports(output, {"threads": [1]}, {"reader": "raw-lines", "unique_keys": 2},
+                          self._mixed_config(operations=5).metadata(5), [{
+                              "implementation_id": "fixture", "threads": 1, "status": "passed",
+                              "stage": "complete", "reason": "", "runner_result": mixed_runner_payload(),
+                          }])
+            report = (output / "report.md").read_text(encoding="utf-8")
+            self.assertIn("混合吞吐量", report)
+            self.assertIn("关闭延迟抽样", report)
+            self.assertIn("单线程重放固定轨迹", report)
+            for static_claim in ("## 线程扩展性", "统一释放", "另建索引的独立单线程抽样", "独立单线程 P50"):
+                self.assertNotIn(static_claim, report)
+
+    def test_operations_wire_matches_frozen_layout_and_validates_fields(self) -> None:
+        operations = [(1, b"", 0, 0), (2, b"a\0", (1 << 64) - 1, 0), (5, b"\xff", 0, 7)]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "operations.bin"
+            digest = write_operations(path, operations)
+            expected = OPERATIONS_MAGIC + struct.pack("<Q", len(operations))
+            for kind, key, value, limit in operations:
+                expected += struct.pack("<BQQQ", kind, value, limit, len(key)) + key
+            self.assertEqual(path.read_bytes(), expected)
+            self.assertEqual(digest, hashlib.sha256(expected).hexdigest())
+            for index, invalid in enumerate(((1, b"a", 1, 0), (2, b"a", 1, 1), (6, b"a", 0, 0))):
+                with self.assertRaises(ValueError):
+                    write_operations(Path(temp) / "invalid-{}.bin".format(index), [invalid])
+
+    def test_current_static_and_mixed_results_are_exactly_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            static = parallel_runner_payload(threads=1)
+            static["schema"] = CURRENT_RUN_SCHEMA
+            static["parameters"] = [{"name": "a", "value": "x=y"}]
+            path.write_text(json.dumps(static), encoding="utf-8")
+            self.assertEqual(
+                parse_runner_result(path, 2, 3, 1, 2, 0, 1, (("a", "x=y"),)), static
+            )
+            historical = parallel_runner_payload(threads=1)
+            path.write_text(json.dumps(historical), encoding="utf-8")
+            with self.assertRaisesRegex(RunFailure, "cannot certify parameters"):
+                parse_runner_result(path, 2, 3, 1, 2, 0, 1, (("a", "x"),))
+
+            mixed = mixed_runner_payload()
+            path.write_text(json.dumps(mixed), encoding="utf-8")
+            expected = (("mode", "exact=value"),)
+            self.assertEqual(parse_runner_result(path, 2, 5, 0, 2, 0, 1, expected), mixed)
+            mutations = (
+                lambda p: p["configured_operations"].update(total=6),
+                lambda p: p["outcomes"].update(find_hits=2),
+                lambda p: p["state"].update(final_key_count=3),
+                lambda p: p["validation"].update(trace_replay_checked=False),
+                lambda p: p["samples"][0].update(operations=4),
+                lambda p: p["parameters"][0].update(value="lost"),
+            )
+            for mutate in mutations:
+                fabricated = mixed_runner_payload()
+                mutate(fabricated)
+                path.write_text(json.dumps(fabricated), encoding="utf-8")
+                with self.assertRaises(RunFailure):
+                    parse_runner_result(path, 2, 5, 0, 2, 0, 1, expected)
+
+    def test_mixed_invocation_selects_operations_and_forwards_parameters_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rows = root / "rows.bin"
+            operations = root / "operations.bin"
+            write_rows(rows, [b"a", b"c"], [0, 2])
+            write_operations(operations, [(1, b"a", 0, 0)] * 5)
+            captured = []
+
+            def fake_run(command, **_kwargs):
+                captured.extend(command)
+                result = Path(command[command.index("--result") + 1])
+                result.write_text(json.dumps(mixed_runner_payload()), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch("benchmark_lib.adapters.subprocess.run", side_effect=fake_run):
+                parsed = invoke_runner(
+                    root / "runner", rows, operations, root / "run", 2, 0, 10,
+                    parameters=(("mode", "exact=value"),), mixed=True,
+                )
+            self.assertEqual(parsed["schema"], MIXED_RUN_SCHEMA)
+            self.assertIn("--operations", captured)
+            self.assertNotIn("--queries", captured)
+            position = captured.index("--parameter")
+            self.assertEqual(captured[position + 1], "mode=exact=value")
+
+    def test_cli_parameters_reject_before_build_and_sort_before_forwarding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            dataset = root / "keys.txt"
+            dataset.write_text("a\nb\nc\nd\n", encoding="utf-8")
+            workload = root / "mixed.json"
+            workload.write_text(json.dumps({"schema": MIXED_SCHEMA, "operations": 5}), encoding="utf-8")
+            manifest = make_manifest(root / "adapter")
+            output = root / "output"
+            with mock.patch.object(benchmark, "_run_implementation", return_value=[]) as run:
+                status = benchmark.main([
+                    "--dataset", str(dataset), "--implementation", str(manifest),
+                    "--workload", str(workload), "--output", str(output),
+                    "--parameter", "fixture:z=last", "--parameter", "fixture:a=x=y",
+                ])
+            self.assertEqual(status, 0)
+            self.assertEqual(run.call_args.args[11], [("a", "x=y"), ("z", "last")])
+            self.assertIs(run.call_args.args[12], True)
+            report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["config"]["parameters"]["fixture"][0]["name"], "a")
+
+            for suffix, parameters in (
+                ("unknown", ["other:x=1"]),
+                ("duplicate", ["fixture:x=2", "fixture:x=3"]),
+                ("malformed", ["fixture:x"]),
+            ):
+                destination = root / suffix
+                arguments = [
+                    "--dataset", str(dataset), "--implementation", str(manifest),
+                    "--output", str(destination),
+                ]
+                for parameter in parameters:
+                    arguments.extend(["--parameter", parameter])
+                with mock.patch.object(benchmark, "_run_implementation") as blocked:
+                    self.assertEqual(benchmark.main(arguments), 2)
+                blocked.assert_not_called()
+
+            loaded = load_manifest(manifest)
+            with mock.patch.object(benchmark, "build_runner", side_effect=BuildFailure("no build")):
+                failures = benchmark._run_implementation(
+                    loaded, 1, root / "failure", root / "rows", root / "operations",
+                    1, 0, 1, 1, 1, [1, 2], [("a", "x=y")], True,
+                )
+            self.assertTrue(all(result["parameters"] == [{"name": "a", "value": "x=y"}]
+                                for result in failures))
+
+    def test_build_identity_covers_all_unified_sources_and_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest = load_manifest(make_manifest(Path(temp) / "adapter"))
+            identity = initial_build_identity(manifest, ROOT)
+        sources = identity["runner_sources_sha256"]
+        self.assertIn("src/unified/runner.cpp", sources)
+        self.assertIn("src/unified/runner.h", sources)
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", digest) for digest in sources.values()))
 
 
 if __name__ == "__main__":

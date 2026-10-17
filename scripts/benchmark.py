@@ -3,10 +3,11 @@
 
 import argparse
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from benchmark_lib.adapters import (
     AdapterManifest,
@@ -16,13 +17,19 @@ from benchmark_lib.adapters import (
     load_manifest,
 )
 from benchmark_lib.errors import BuildFailure, InputError, ResourceBudget, RunFailure
-from benchmark_lib.interchange import write_queries, write_rows
+from benchmark_lib.interchange import write_operations, write_queries, write_rows
 from benchmark_lib.reports import write_reports
 from benchmark_lib.dataset import prepare_dataset
-from benchmark_lib.workload import generate_queries, load_workload
+from benchmark_lib.workload import (
+    MixedWorkloadConfig,
+    generate_mixed_operations,
+    generate_queries,
+    load_workload,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PARAMETER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 
 
 def _positive_integer(value: str) -> int:
@@ -52,12 +59,13 @@ def _threads(value: str) -> int:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description=(
-            "Run static point lookups with serial or shared-index parallel reads. "
+            "Run static point lookups or deterministic serial mixed operations. "
             "Implemented readers: raw-lines, JSONL string field, and strict legacy TLI."
         ),
         epilog=(
-            "This slice validates and measures bulk_load/find only; insert, update, "
-            "erase, scan, range_sum, directories, and reader plugins are not implemented."
+            "Static profiles validate bulk_load/find only. Mixed traces require only the "
+            "capabilities used by their configured operations. "
+            "Directories and reader plugins are not implemented."
         ),
     )
     result.add_argument("--dataset", required=True, type=Path, help="one input file")
@@ -86,10 +94,17 @@ def parser() -> argparse.ArgumentParser:
         "--workload",
         type=Path,
         help=(
-            "static-uniform-point/v1 or static-point/v2 JSON overriding "
+            "static-uniform-point/v1, static-point/v2, or mixed-operations/v1 JSON overriding "
             "seed/operations/miss_ratio/repeats/latency_samples; "
             "v2 supports uniform, hotspot and Zipf access"
         ),
+    )
+    result.add_argument(
+        "--parameter",
+        action="append",
+        default=[],
+        metavar="ADAPTER:NAME=VALUE",
+        help="adapter factory parameter; repeatable and forwarded verbatim",
     )
     result.add_argument(
         "--build-timeout",
@@ -154,6 +169,7 @@ def _invalid_manifest_result(path: Path, ordinal: int, reason: str) -> Dict[str,
         "status": "invalid_input",
         "stage": "manifest",
         "reason": reason,
+        "parameters": [],
         "build_identity": initial_build_identity(None, ROOT, path),
         "runner_result": None,
     }
@@ -190,6 +206,7 @@ def _status_result(
     stage: str,
     reason: str,
     build_identity: Optional[Dict[str, Any]] = None,
+    parameters: Sequence[Tuple[str, str]] = (),
 ) -> Dict[str, Any]:
     return {
         "implementation_id": manifest.adapter_id,
@@ -199,6 +216,7 @@ def _status_result(
         "status": status,
         "stage": stage,
         "reason": reason,
+        "parameters": [{"name": name, "value": value} for name, value in parameters],
         "build_identity": (
             build_identity
             if build_identity is not None
@@ -233,7 +251,43 @@ def _config_metadata(args: argparse.Namespace, output: Path) -> Dict[str, Any]:
         "implementation_execution": "sequential; one build per adapter",
         "memory_budget_mib": args.memory_budget_mib,
         "network_downloads": "not performed by the benchmark",
+        "parameters": {
+            adapter_id: [{"name": name, "value": value} for name, value in values]
+            for adapter_id, values in getattr(args, "parameter_map", {}).items()
+        },
     }
+
+
+def _validated_parameters(
+    raw_parameters: List[str],
+    manifest_entries: List[Tuple[Optional[AdapterManifest], Optional[Dict[str, Any]]]],
+) -> Dict[str, List[Tuple[str, str]]]:
+    known = {
+        manifest.adapter_id
+        for manifest, _invalid in manifest_entries
+        if manifest is not None
+    }
+    result = {adapter_id: [] for adapter_id in sorted(known)}
+    seen = set()
+    for raw in raw_parameters:
+        if ":" not in raw:
+            raise InputError("--parameter must use ADAPTER:NAME=VALUE")
+        adapter_id, assignment = raw.split(":", 1)
+        if "=" not in assignment:
+            raise InputError("--parameter must use ADAPTER:NAME=VALUE")
+        name, value = assignment.split("=", 1)
+        if adapter_id not in known:
+            raise InputError("--parameter names an unknown requested adapter")
+        if PARAMETER_NAME.fullmatch(name) is None:
+            raise InputError("--parameter name is malformed")
+        identity = (adapter_id, name)
+        if identity in seen:
+            raise InputError("--parameter duplicates an adapter parameter name")
+        seen.add(identity)
+        result[adapter_id].append((name, value))
+    for values in result.values():
+        values.sort(key=lambda item: item[0])
+    return result
 
 
 def _resource_budget_report(
@@ -254,7 +308,10 @@ def _resource_budget_report(
         else:
             assert manifest is not None
             results.append(
-                _status_result(manifest, "skipped", "resource_budget", reason)
+                _status_result(
+                    manifest, "skipped", "resource_budget", reason,
+                    parameters=getattr(args, "parameter_map", {}).get(manifest.adapter_id, ()),
+                )
             )
     if dataset_metadata is None:
         dataset_metadata = _unavailable_dataset_metadata(args, "resource_budget")
@@ -312,7 +369,10 @@ def _invalid_input_report(
     for ordinal, (manifest, invalid_result) in enumerate(manifest_entries, 1):
         if manifest is not None:
             results.append(
-                _status_result(manifest, "invalid_input", stage, reason)
+                _status_result(
+                    manifest, "invalid_input", stage, reason,
+                    parameters=getattr(args, "parameter_map", {}).get(manifest.adapter_id, ()),
+                )
             )
         else:
             requested_path = args.implementation[ordinal - 1]
@@ -340,18 +400,22 @@ def _run_implementation(
     ordinal: int,
     output: Path,
     rows_path: Path,
-    queries_path: Path,
+    workload_path: Path,
     repeats: int,
     latency_samples: int,
     build_timeout: int,
     run_timeout: int,
     jobs: int,
     threads: Optional[List[int]] = None,
+    parameters: Sequence[Tuple[str, str]] = (),
+    mixed: bool = False,
 ) -> List[Dict[str, Any]]:
     thread_counts = threads if threads is not None else [1]
 
     def statuses(status: str, stage: str, reason: str, identity: Any) -> List[Dict[str, Any]]:
-        return [dict(_status_result(manifest, status, stage, reason, identity), threads=n)
+        return [dict(_status_result(
+            manifest, status, stage, reason, identity, parameters=parameters
+        ), threads=n)
                 for n in thread_counts]
 
     build_root = output / "builds" / "{:03d}-{}".format(ordinal, manifest.adapter_id)
@@ -370,18 +434,20 @@ def _run_implementation(
         run_root.parent.mkdir(parents=True, exist_ok=True)
         try:
             runner_result = invoke_runner(
-                executable, rows_path, queries_path, run_root,
+                executable, rows_path, workload_path, run_root,
                 repeats, latency_samples, run_timeout, threads=n,
+                parameters=parameters, mixed=mixed,
             )
         except RunFailure as error:
             results.append(dict(_status_result(
-                manifest, "failed", "run", str(error), build_identity
+                manifest, "failed", "run", str(error), build_identity,
+                parameters=parameters,
             ), threads=n))
             continue
         result = _status_result(
             manifest, runner_result["status"],
             runner_result.get("stage", "complete"), runner_result.get("reason", ""),
-            build_identity,
+            build_identity, parameters=parameters,
         )
         result["threads"] = n
         result["runner_result"] = runner_result
@@ -402,6 +468,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     memory_budget_bytes = args.memory_budget_mib * 1024 * 1024
     manifest_entries = _validated_manifests(args.implementation)
+    args.parameter_map = {
+        manifest.adapter_id: []
+        for manifest, _invalid in manifest_entries
+        if manifest is not None
+    }
+    try:
+        args.parameter_map = _validated_parameters(args.parameter, manifest_entries)
+    except InputError as error:
+        return _invalid_input_report(
+            args, output, manifest_entries, "parameters", str(error)
+        )
     try:
         workload = load_workload(args.workload)
     except InputError as error:
@@ -436,7 +513,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         remaining_budget = memory_budget_bytes - dataset.estimated_memory_bytes
         if remaining_budget <= 0:
             raise ResourceBudget("no memory budget remains for workload generation")
-        queries, miss_count = generate_queries(dataset.keys, workload, remaining_budget)
+        if isinstance(workload, MixedWorkloadConfig):
+            prepared_mixed = generate_mixed_operations(
+                dataset.keys, workload, remaining_budget
+            )
+            queries = []
+            miss_count = 0
+        else:
+            prepared_mixed = None
+            queries, miss_count = generate_queries(
+                dataset.keys, workload, remaining_budget
+            )
     except ResourceBudget as error:
         return _resource_budget_report(
             args, output, manifest_entries, workload, str(error), dataset.metadata()
@@ -461,9 +548,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     interchange = output / "interchange"
     interchange.mkdir()
     rows_path = interchange / "rows.bin"
-    queries_path = interchange / "queries.bin"
-    rows_sha256 = write_rows(rows_path, dataset.keys)
-    queries_sha256 = write_queries(queries_path, queries)
+    mixed = prepared_mixed is not None
+    if prepared_mixed is not None:
+        workload_path = interchange / "operations.bin"
+        rows_sha256 = write_rows(
+            rows_path, prepared_mixed.initial_keys, prepared_mixed.initial_values
+        )
+        workload_sha256 = write_operations(workload_path, prepared_mixed.operations)
+    else:
+        workload_path = interchange / "queries.bin"
+        rows_sha256 = write_rows(rows_path, dataset.keys)
+        workload_sha256 = write_queries(workload_path, queries)
 
     results = []  # type: List[Dict[str, Any]]
     for ordinal, (manifest, invalid_result) in enumerate(manifest_entries, 1):
@@ -471,13 +566,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             results.append(invalid_result)
             continue
         assert manifest is not None
-        if not dataset.keys:
+        parameters = args.parameter_map.get(manifest.adapter_id, [])
+        if not dataset.keys and not mixed:
             results.append(
                 _status_result(
                     manifest,
                     "skipped",
                     "workload",
                     "empty dataset has no keys for the configured static workload",
+                    parameters=parameters,
                 )
             )
             continue
@@ -487,18 +584,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ordinal,
                 output,
                 rows_path,
-                queries_path,
+                workload_path,
                 workload.repeats,
                 workload.latency_samples,
                 args.build_timeout_seconds,
                 args.run_timeout_seconds,
                 args.jobs,
                 args.threads,
+                parameters,
+                mixed,
             )
         )
 
-    workload_metadata = workload.metadata(len(queries), miss_count, queries, len(dataset.keys))
-    workload_metadata["queries_sha256"] = queries_sha256
+    if prepared_mixed is not None:
+        workload_metadata = prepared_mixed.metadata
+        workload_metadata["operations_sha256"] = workload_sha256
+    else:
+        workload_metadata = workload.metadata(
+            len(queries), miss_count, queries, len(dataset.keys)
+        )
+        workload_metadata["queries_sha256"] = workload_sha256
     config = _config_metadata(args, output)
     dataset_metadata = dataset.metadata()
     dataset_metadata["rows_sha256"] = rows_sha256

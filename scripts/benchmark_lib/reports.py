@@ -311,6 +311,7 @@ def write_reports(
     workload: Dict[str, Any],
     results: List[Dict[str, Any]],
 ) -> None:
+    mixed = workload.get("schema") == "mixed-operations/v1"
     # Global preparation/build failures still have one row per requested pair.
     results = [
         dict(result, threads=threads)
@@ -319,24 +320,39 @@ def write_reports(
     ]
     summaries = scaling_summaries(results)
     scaling = [{field: row[field] for field in SCALING_FIELDS} for row in summaries]
+    environment = environment_metadata()
+    if mixed:
+        environment["threading"] = "serial mixed trace; threads greater than one are unsupported"
     report = {
         "schema": "string-index-benchmark-report/v2",
         "generated_at": utc_timestamp(),
-        "scope": "static unique-key point lookup, serial and shared-index concurrent reads",
+        "scope": (
+            "deterministic serial mixed string-index operations"
+            if mixed else
+            "static unique-key point lookup, serial and shared-index concurrent reads"
+        ),
         "config": config,
         "dataset": dataset,
         "workload": workload,
-        "environment": environment_metadata(),
+        "environment": environment,
         "results": results,
         "scaling": scaling,
-        "limitations": [
-            "Only bulk_load and find are accredited; concurrent writes are not measured.",
-            "Latency includes timer overhead; the process is not CPU-pinned.",
-            "Latency is measured separately with one thread, not under parallel load.",
-            "Total queries are fixed across threads; no warmup, no thread creation in lookup timing.",
-            "Concurrent correctness checks do not prove absence of every possible data race.",
-            "Memory fields retain the adapter's accounting scope and are not ranked.",
-        ],
+        "limitations": (
+            [
+                "Mixed operations are serial and aggregate throughput has no per-operation breakdown.",
+                "Mixed latency sampling is disabled; scans consume rows but report aggregate timing only.",
+                "The process is not CPU-pinned; memory fields retain adapter accounting scope.",
+            ]
+            if mixed else
+            [
+                "Only bulk_load and find are accredited; concurrent writes are not measured.",
+                "Latency includes timer overhead; the process is not CPU-pinned.",
+                "Latency is measured separately with one thread, not under parallel load.",
+                "Total queries are fixed across threads; no warmup, no thread creation in lookup timing.",
+                "Concurrent correctness checks do not prove absence of every possible data race.",
+                "Memory fields retain the adapter's accounting scope and are not ranked.",
+            ]
+        ),
     }
     (output / "report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -370,7 +386,11 @@ def write_reports(
     lines = [
         "# 字符串索引统一评测报告",
         "",
-        "本报告覆盖内存、唯一键 map 的静态点查询，支持单线程和共享索引实例的并发只读查询。验收 `bulk_load` 和 `find`。",
+        (
+            "本报告覆盖确定性单线程混合操作轨迹，按实际非零操作要求能力，并用独立 oracle 校验状态变化。"
+            if mixed else
+            "本报告覆盖内存、唯一键 map 的静态点查询，支持单线程和共享索引实例的并发只读查询。验收 `bulk_load` 和 `find`。"
+        ),
         "",
         "## 数据与负载",
         "",
@@ -381,71 +401,96 @@ def write_reports(
             _markdown_cell(dataset.get("duplicate_records")),
         ),
         "- 逻辑哈希（SHA-256）：`{}`".format(dataset.get("logical_sha256", "")),
-        "- 负载：`{}`；请求数：{}；受控未命中：{}；重复：{}".format(
+        "- 负载：`{}`；请求数：{}；{}：{}；重复：{}".format(
             workload.get("schema", ""),
             _markdown_cell(workload.get("actual_operations")),
-            _markdown_cell(workload.get("controlled_misses")),
+            "实际最终键数" if mixed else "受控未命中",
+            _markdown_cell(workload.get("final_key_count") if mixed else workload.get("controlled_misses")),
             _markdown_cell(workload.get("repeats")),
         ),
         *_workload_lines(workload),
         "- 查询线程数：{}；各配置依次运行，每个适配器仅编译一次。".format(
             ", ".join(str(n) for n in config.get("threads", [1]))),
-        "- 每轮总请求数固定，连续均分给工作线程，不随线程数增加。",
+        (
+            "- 每轮重放同一混合轨迹；线程数大于 1 的配置会结构化报告不支持。"
+            if mixed else
+            "- 每轮总请求数固定，连续均分给工作线程，不随线程数增加。"
+        ),
         "",
         "## 实现结果",
         "",
-        "| 实现 ID | 线程数 | 状态 | 阶段 | 原因 | 构建中位数（ns） | 吞吐量中位数（ops/s） | 吞吐量范围（ops/s） | 吞吐量标准差 | 独立单线程 P50（ns） | 独立单线程 P99（ns） |",
-        "| --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        (
+            "| 实现 ID | 线程数 | 状态 | 阶段 | 原因 | 构建中位数（ns） | 混合吞吐量中位数（ops/s） | 吞吐量范围（ops/s） | 吞吐量标准差 |"
+            if mixed else
+            "| 实现 ID | 线程数 | 状态 | 阶段 | 原因 | 构建中位数（ns） | 吞吐量中位数（ops/s） | 吞吐量范围（ops/s） | 吞吐量标准差 | 独立单线程 P50（ns） | 独立单线程 P99（ns） |"
+        ),
+        "| --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: |" + ("" if mixed else " ---: | ---: |"),
     ]
     for row in summaries:
-        lines.append(
-            "| {} | {} | {} | {} | {} | {} | {} | {}–{} | {} | {} | {} |".format(
-                *(
-                    _markdown_cell(row[name])
-                    for name in (
-                        "implementation_id",
-                        "threads",
-                        "status",
-                        "stage",
-                        "reason",
-                        "median_build_ns",
-                        "median_throughput_ops_per_second",
-                        "min_throughput_ops_per_second",
-                        "max_throughput_ops_per_second",
-                        "stdev_throughput_ops_per_second",
-                        "latency_p50_ns",
-                        "latency_p99_ns",
-                    )
+        cells = [_markdown_cell(row[name]) for name in (
+            "implementation_id", "threads", "status", "stage", "reason",
+            "median_build_ns", "median_throughput_ops_per_second",
+        )]
+        cells.append("{}–{}".format(
+            _markdown_cell(row["min_throughput_ops_per_second"]),
+            _markdown_cell(row["max_throughput_ops_per_second"]),
+        ))
+        cells.append(_markdown_cell(row["stdev_throughput_ops_per_second"]))
+        if not mixed:
+            cells.extend(_markdown_cell(row[name]) for name in ("latency_p50_ns", "latency_p99_ns"))
+        lines.append("| " + " | ".join(cells) + " |")
+    if not mixed:
+        lines.extend([
+            "", "## 线程扩展性", "",
+            "加速比 = 当前吞吐量中位数 / 同一实现的单线程吞吐量中位数；并行效率 = 加速比 / 线程数。未请求单线程、单线程失败或总操作数不同时留空。", "",
+            "| 实现 ID | 线程数 | 状态 | 加速比 | 并行效率 |",
+            "| --- | ---: | --- | ---: | ---: |",
+        ])
+        for row in summaries:
+            lines.append("| {} | {} | {} | {} | {} |".format(*(
+                _markdown_cell(row[name]) for name in (
+                    "implementation_id", "threads", "status", "speedup_vs_1_thread", "parallel_efficiency"
                 )
-            )
-        )
+            )))
     lines.extend([
-        "", "## 线程扩展性", "",
-        "加速比 = 当前吞吐量中位数 / 同一实现的单线程吞吐量中位数；并行效率 = 加速比 / 线程数。未请求单线程、单线程失败或总操作数不同时留空。", "",
-        "| 实现 ID | 线程数 | 状态 | 加速比 | 并行效率 |",
-        "| --- | ---: | --- | ---: | ---: |",
+        "", "## 解读限制", "",
+        "失败、跳过和不支持的实现保留在所有汇总文件中，性能列为空，不以零值代替。内存分项只有在适配器给出明确口径时才展示；本报告不据此生成内存排名。进程未绑核，小规模结果不用于论文级排名。",
     ])
-    for row in summaries:
-        lines.append("| {} | {} | {} | {} | {} |".format(*(
-            _markdown_cell(row[name]) for name in (
-                "implementation_id", "threads", "status", "speedup_vs_1_thread", "parallel_efficiency"
-            )
-        )))
-    lines.extend(
-        [
-            "",
-            "## 解读限制",
-            "",
-            "失败、跳过和不支持的实现保留在所有汇总文件中，性能列为空，不以零值代替。内存分项只有在适配器给出明确口径时才展示；本报告不据此生成内存排名。延迟包含计时器开销，进程未绑核，小规模结果不用于论文级排名。",
-            "并行吞吐量计时从所有工作线程就绪后的统一释放开始，到全部完成为止；不含创建/回收线程及构建，包含调度和同步开销。延迟来自另建索引的独立单线程抽样，不是并发负载下的尾延迟；默认不预热。并发校验通过只说明本次工作负载通过，不证明实现没有数据竞争。",
+    if mixed:
+        lines.extend([
+            "混合操作按单线程重放固定轨迹，每轮重新构造并加载初始状态；独立参照、修改后读回和最终状态检查在计时之外。一次扫描计一次操作，返回行数另列，结果物化与消费计入操作时间。",
+            "本场景关闭延迟抽样，不提供 P50/P99 或各类操作的单独延迟，也不进行线程扩展测量。线程数大于 1 的组合明确报告不支持；scaling.csv 的公共格式不代表混合并发测量。",
+            "`workers.csv` 保留每轮单个执行线程的操作数、耗时与校验和。运行环境和继承的 CPU 亲和性见 `report.json`。",
+        ])
+    else:
+        lines.extend([
+            "并行吞吐量计时从所有工作线程就绪后的统一释放开始，到全部完成为止；不含创建/回收线程及构建，包含调度和同步开销。延迟来自另建索引的独立单线程抽样，不是并发负载下的尾延迟；延迟包含计时器开销，默认不预热。并发校验通过只说明本次工作负载通过，不证明实现没有数据竞争。",
             "`workers.csv` 保留每轮各线程的操作数、耗时与校验和；`scaling.csv` 可直接绘制扩展性曲线。运行环境和继承的 CPU 亲和性见 `report.json`。",
-            "",
-        ]
-    )
+        ])
+    lines.append("")
     (output / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _workload_lines(workload: Dict[str, Any]) -> List[str]:
+    if workload.get("schema") == "mixed-operations/v1":
+        configured = workload.get("configured_operations") or {}
+        outcomes = workload.get("actual_result_counts") or {}
+        return [
+            "- 配置操作数：find {}；insert {}；update {}；erase {}；scan {}。".format(
+                *(_markdown_cell(configured.get(name)) for name in ("find", "insert", "update", "erase", "scan"))
+            ),
+            "- 初始键 {}；留出键 {}；最终键 {}；实际 find 命中/未命中 {}/{}。".format(
+                _markdown_cell(workload.get("initial_key_count")),
+                _markdown_cell(workload.get("held_out_key_count")),
+                _markdown_cell(workload.get("final_key_count")),
+                _markdown_cell(outcomes.get("find_hits")),
+                _markdown_cell(outcomes.get("find_misses")),
+            ),
+            "- 初始值策略：{}；操作轨迹哈希（SHA-256）：`{}`".format(
+                _markdown_cell(workload.get("initial_value_policy")),
+                workload.get("operations_sha256", ""),
+            ),
+        ]
     distribution = workload.get("distribution")
     if distribution is None and workload.get("schema") == "static-uniform-point/v1":
         distribution = "uniform"

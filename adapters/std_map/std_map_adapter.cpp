@@ -42,10 +42,14 @@ class StdMapIndex final : public string_index_bench::v1::Index {
     string_index_bench::v1::Descriptor descriptor;
     descriptor.implementation = "C++ standard ordered map";
     descriptor.implementation_version = "c++17";
-    descriptor.adapter_version = "builtin-std-map-v1";
+    descriptor.adapter_version = "builtin-std-map-v2";
     descriptor.capabilities.bulk_load =
         string_index_bench::v1::Support::adapted;
     descriptor.capabilities.find = string_index_bench::v1::Support::native;
+    descriptor.capabilities.insert = string_index_bench::v1::Support::native;
+    descriptor.capabilities.update = string_index_bench::v1::Support::native;
+    descriptor.capabilities.erase = string_index_bench::v1::Support::native;
+    descriptor.capabilities.scan = string_index_bench::v1::Support::native;
     descriptor.capabilities.concurrent_find = true;
     descriptor.adaptation_notes =
         "bulk_load is adapted by inserting each sorted input row into "
@@ -78,22 +82,46 @@ class StdMapIndex final : public string_index_bench::v1::Index {
   }
 
   string_index_bench::v1::InsertResult insert(
-      std::string_view, string_index_bench::v1::Value) override {
-    throw string_index_bench::v1::UnsupportedOperation("insert unsupported");
+      std::string_view key, string_index_bench::v1::Value value) override {
+    require_loaded();
+    const auto inserted = values_.emplace(std::string(key), value);
+    return inserted.second
+               ? string_index_bench::v1::InsertResult::inserted
+               : string_index_bench::v1::InsertResult::already_exists;
   }
 
   string_index_bench::v1::UpdateResult update(
-      std::string_view, string_index_bench::v1::Value) override {
-    throw string_index_bench::v1::UnsupportedOperation("update unsupported");
+      std::string_view key, string_index_bench::v1::Value value) override {
+    require_loaded();
+    const auto found = values_.find(key);
+    if (found == values_.end()) {
+      return string_index_bench::v1::UpdateResult::not_found;
+    }
+    found->second = value;
+    return string_index_bench::v1::UpdateResult::updated;
   }
 
-  string_index_bench::v1::EraseResult erase(std::string_view) override {
-    throw string_index_bench::v1::UnsupportedOperation("erase unsupported");
+  string_index_bench::v1::EraseResult erase(std::string_view key) override {
+    require_loaded();
+    const auto found = values_.find(key);
+    if (found == values_.end()) {
+      return string_index_bench::v1::EraseResult::not_found;
+    }
+    values_.erase(found);
+    return string_index_bench::v1::EraseResult::erased;
   }
 
-  std::vector<string_index_bench::v1::Row> scan(std::string_view,
-                                                 std::size_t) const override {
-    throw string_index_bench::v1::UnsupportedOperation("scan unsupported");
+  std::vector<string_index_bench::v1::Row> scan(
+      std::string_view lower_bound, std::size_t limit) const override {
+    require_loaded();
+    std::vector<string_index_bench::v1::Row> rows;
+    rows.reserve(std::min(limit, values_.size()));
+    auto current = values_.lower_bound(lower_bound);
+    while (current != values_.end() && rows.size() < limit) {
+      rows.push_back({current->first, current->second});
+      ++current;
+    }
+    return rows;
   }
 
   string_index_bench::v1::Value range_sum(std::string_view,
@@ -114,7 +142,7 @@ class StdMapIndex final : public string_index_bench::v1::Index {
  private:
   void require_loaded() const {
     if (!loaded_) {
-      throw std::logic_error("find called before bulk_load");
+      throw std::logic_error("operation called before bulk_load");
     }
   }
 

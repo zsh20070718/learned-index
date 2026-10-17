@@ -4,7 +4,8 @@ import bisect
 import hashlib
 import json
 import random
-from dataclasses import dataclass
+import struct
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
 from pathlib import Path
@@ -15,6 +16,7 @@ from .errors import InputError, ResourceBudget
 
 SCHEMA = "static-uniform-point/v1"
 POINT_SCHEMA = "static-point/v2"
+MIXED_SCHEMA = "mixed-operations/v1"
 DEFAULT_SEED = 42
 DEFAULT_OPERATIONS = 10000
 DEFAULT_MISS_RATIO = Fraction(1, 10)
@@ -34,6 +36,10 @@ _DISTRIBUTION_FIELDS = {
     "zipf": {"zipf_exponent"},
 }
 Query = Tuple[bytes, bool, int]
+Operation = Tuple[int, bytes, int, int]
+OPERATION_NAMES = ("find", "insert", "update", "erase", "scan")
+OPERATION_KINDS = {name: index + 1 for index, name in enumerate(OPERATION_NAMES)}
+UINT64_MAX = (1 << 64) - 1
 
 
 def _object_without_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
@@ -140,6 +146,78 @@ class WorkloadConfig:
         return metadata
 
 
+@dataclass(frozen=True)
+class MixedWorkloadConfig:
+    seed: int = DEFAULT_SEED
+    operations: int = DEFAULT_OPERATIONS
+    initial_load_fraction: Fraction = Fraction(1, 2)
+    operation_weights: Dict[str, Fraction] = field(default_factory=lambda: {
+        "find": Fraction(4, 5),
+        "insert": Fraction(1, 5),
+        "update": Fraction(0),
+        "erase": Fraction(0),
+        "scan": Fraction(0),
+    })
+    read_miss_ratio: Fraction = DEFAULT_MISS_RATIO
+    scan_length: int = 16
+    repeats: int = DEFAULT_REPEATS
+    latency_samples: int = 0
+    source: Optional[Path] = None
+    schema: str = MIXED_SCHEMA
+
+    def configured_counts(self) -> Dict[str, int]:
+        if set(self.operation_weights) - set(OPERATION_NAMES):
+            raise InputError("workload operation_weights contains unsupported operations")
+        weights = [self.operation_weights.get(name, Fraction(0)) for name in OPERATION_NAMES]
+        if any(not isinstance(weight, Fraction) or weight < 0 or weight > 1 for weight in weights):
+            raise InputError("workload operation_weights must contain exact fractions between zero and one")
+        if sum(weights, Fraction(0)) != 1:
+            raise InputError("workload operation_weights must sum exactly to one")
+        floors = [
+            (self.operations * weight.numerator) // weight.denominator
+            for weight in weights
+        ]
+        remainders = [
+            Fraction(self.operations * weight.numerator, weight.denominator) - floor
+            for weight, floor in zip(weights, floors)
+        ]
+        remaining = self.operations - sum(floors)
+        order = sorted(range(len(floors)), key=lambda index: (-remainders[index], index))
+        for index in order[:remaining]:
+            floors[index] += 1
+        result = {name: count for name, count in zip(OPERATION_NAMES, floors)}
+        result["total"] = sum(floors)
+        return result
+
+    def metadata(self, actual_operations: int = 0, _unused: int = 0) -> Dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "seed": self.seed,
+            "operations": self.operations,
+            "actual_operations": actual_operations,
+            "initial_load_fraction_decimal": _decimal_text(self.initial_load_fraction),
+            "operation_weights_decimal": {
+                name: _decimal_text(self.operation_weights.get(name, Fraction(0)))
+                for name in OPERATION_NAMES
+            },
+            "configured_operations": self.configured_counts(),
+            "read_miss_ratio_decimal": _decimal_text(self.read_miss_ratio),
+            "scan_length": self.scan_length,
+            "repeats": self.repeats,
+            "latency_samples": self.latency_samples,
+            "source": str(self.source) if self.source else None,
+        }
+
+
+@dataclass
+class PreparedMixedWorkload:
+    initial_keys: List[bytes]
+    initial_values: List[int]
+    held_out_keys: List[bytes]
+    operations: List[Operation]
+    metadata: Dict[str, Any]
+
+
 def _observed_access(
     queries: Sequence[Query], key_count: int, config: WorkloadConfig,
 ) -> Dict[str, Any]:
@@ -180,7 +258,7 @@ def _observed_access(
     return observed
 
 
-def load_workload(path: Optional[Path]) -> WorkloadConfig:
+def load_workload(path: Optional[Path]) -> Any:
     if path is None:
         return WorkloadConfig()
     source = Path(path)
@@ -196,8 +274,47 @@ def load_workload(path: Optional[Path]) -> WorkloadConfig:
     if not isinstance(raw, dict):
         raise InputError("workload JSON must be one object")
     schema = raw.get("schema", SCHEMA)
+    if schema == MIXED_SCHEMA:
+        allowed = {
+            "schema", "seed", "operations", "initial_load_fraction",
+            "operation_weights", "read_miss_ratio", "scan_length", "repeats",
+            "latency_samples",
+        }
+        if set(raw) - allowed:
+            raise InputError("workload JSON contains unsupported fields")
+        weights_raw = raw.get("operation_weights")
+        if weights_raw is None:
+            weights = {
+                "find": Fraction(4, 5), "insert": Fraction(1, 5),
+                "update": Fraction(0), "erase": Fraction(0), "scan": Fraction(0),
+            }
+        else:
+            if not isinstance(weights_raw, dict):
+                raise InputError("workload operation_weights must be an object")
+            if set(weights_raw) - set(OPERATION_NAMES):
+                raise InputError("workload operation_weights contains unsupported operations")
+            weights = dict(
+                (name, _decimal_fraction(weights_raw.get(name, 0), "operation_weights.{}".format(name)))
+                for name in OPERATION_NAMES
+            )
+        if sum(weights.values(), Fraction(0)) != 1:
+            raise InputError("workload operation_weights must sum exactly to one")
+        latency_samples = _integer(raw.get("latency_samples", 0), "latency_samples", 0, (1 << 31) - 1)
+        if latency_samples != 0:
+            raise InputError("mixed workload latency_samples must be zero")
+        return MixedWorkloadConfig(
+            seed=_integer(raw.get("seed", DEFAULT_SEED), "seed", 0, UINT64_MAX),
+            operations=_integer(raw.get("operations", DEFAULT_OPERATIONS), "operations", 1, (1 << 63) - 1),
+            initial_load_fraction=_decimal_fraction(raw.get("initial_load_fraction", "0.5"), "initial_load_fraction"),
+            operation_weights=weights,
+            read_miss_ratio=_decimal_fraction(raw.get("read_miss_ratio", "0.1"), "read_miss_ratio"),
+            scan_length=_integer(raw.get("scan_length", 16), "scan_length", 0, (1 << 63) - 1),
+            repeats=_integer(raw.get("repeats", DEFAULT_REPEATS), "repeats", 1, 1000),
+            latency_samples=latency_samples,
+            source=source.resolve(),
+        )
     if schema not in (SCHEMA, POINT_SCHEMA):
-        raise InputError("workload schema must be {} or {}".format(SCHEMA, POINT_SCHEMA))
+        raise InputError("workload schema must be {}, {} or {}".format(SCHEMA, POINT_SCHEMA, MIXED_SCHEMA))
     distribution = raw.get("distribution", "uniform") if schema == POINT_SCHEMA else "uniform"
     if not isinstance(distribution, str) or distribution not in _DISTRIBUTION_FIELDS:
         raise InputError("workload distribution must be uniform, hotspot or zipf")
@@ -332,3 +449,289 @@ def generate_queries(
         else:
             queries.append((keys[source_index], True, source_index))
     return queries, miss_count
+
+
+class _RandomPool:
+    def __init__(self, values: Sequence[bytes] = ()) -> None:
+        self.values = list(values)
+        self.positions = {value: index for index, value in enumerate(self.values)}
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def choose(self, rng: random.Random) -> bytes:
+        return self.values[rng.randrange(len(self.values))]
+
+    def add(self, value: bytes) -> None:
+        if value in self.positions:
+            return
+        self.positions[value] = len(self.values)
+        self.values.append(value)
+
+    def remove(self, value: bytes) -> None:
+        index = self.positions.pop(value)
+        tail = self.values.pop()
+        if index < len(self.values):
+            self.values[index] = tail
+            self.positions[tail] = index
+
+    def pop_random(self, rng: random.Random) -> bytes:
+        value = self.choose(rng)
+        self.remove(value)
+        return value
+
+
+def _stream_rng(seed: int, label: str) -> random.Random:
+    digest = hashlib.sha256(seed.to_bytes(8, "little") + label.encode("ascii")).digest()
+    return random.Random(int.from_bytes(digest, "big"))
+
+
+def _partition_digest(keys: Sequence[bytes], values: Optional[Sequence[int]] = None) -> str:
+    digest = hashlib.sha256()
+    if values is None:
+        iterator = ((key, None) for key in keys)
+    else:
+        iterator = zip(keys, values)
+    for key, value in iterator:
+        digest.update(struct.pack("<Q", len(key)))
+        digest.update(key)
+        if value is not None:
+            digest.update(struct.pack("<Q", value))
+    return digest.hexdigest()
+
+
+def _budget_limit(budget: Any) -> int:
+    if isinstance(budget, bool):
+        raise ResourceBudget("workload generation exceeds --memory-budget-mib")
+    if isinstance(budget, int):
+        return budget
+    for name in ("remaining_bytes", "memory_budget_bytes", "limit_bytes", "bytes"):
+        value = getattr(budget, name, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    raise ResourceBudget("workload generation has no usable memory budget")
+
+
+def generate_mixed_operations(
+    keys: Sequence[bytes], config: MixedWorkloadConfig, budget: ResourceBudget
+) -> PreparedMixedWorkload:
+    full_keys = sorted(set(keys))
+    total_key_bytes = sum(len(key) for key in full_keys)
+    estimated = total_key_bytes * 3 + len(full_keys) * 480 + config.operations * 256
+    limit = _budget_limit(budget)
+    if estimated > limit:
+        raise ResourceBudget("workload generation exceeds --memory-budget-mib")
+
+    counts = config.configured_counts()
+    order_rng = _stream_rng(config.seed, "operation-order")
+    partition_rng = _stream_rng(config.seed, "initial-partition")
+    target_rng = _stream_rng(config.seed, "operation-targets")
+    value_rng = _stream_rng(config.seed, "operation-values")
+
+    initial_count = (
+        len(full_keys) * config.initial_load_fraction.numerator
+        // config.initial_load_fraction.denominator
+    )
+    selected = set(partition_rng.sample(range(len(full_keys)), initial_count))
+    initial_values = [index for index in range(len(full_keys)) if index in selected]
+    initial_keys = [full_keys[index] for index in initial_values]
+    held_out_keys = [key for index, key in enumerate(full_keys) if index not in selected]
+
+    kinds = []  # type: List[int]
+    for name in OPERATION_NAMES:
+        kinds.extend([OPERATION_KINDS[name]] * counts[name])
+    order_rng.shuffle(kinds)
+    find_misses = (
+        counts["find"] * config.read_miss_ratio.numerator
+        // config.read_miss_ratio.denominator
+    )
+    miss_find_ordinals = set(target_rng.sample(range(counts["find"]), find_misses))
+
+    original_keys = set(full_keys)
+    known_keys = set(full_keys)
+    live = _RandomPool(initial_keys)
+    absent_original = _RandomPool(held_out_keys)
+    absent_synthetic = _RandomPool()
+    live_values = dict(zip(initial_keys, initial_values))
+    ordered_live = list(initial_keys)
+    operations = []  # type: List[Operation]
+    outcomes = {
+        "find_hits": 0, "find_misses": 0,
+        "insert_inserted": 0, "insert_already_exists": 0,
+        "update_updated": 0, "update_not_found": 0,
+        "erase_erased": 0, "erase_not_found": 0,
+        "scan_calls": 0, "scan_rows": 0,
+    }
+    fixture_counts = {
+        "intentional_duplicate_inserts": 0,
+        "intentional_missing_updates": 0,
+        "intentional_missing_erases": 0,
+    }
+    insert_sources = {"original": 0, "synthetic": 0}
+    ordinals = {name: 0 for name in OPERATION_NAMES}
+    duplicate_insert_done = missing_update_done = missing_erase_done = False
+    synthetic_ordinal = 0
+    generated_value_ordinal = 0
+    touched = set()
+    peak_live = len(live)
+    peak_absent = len(absent_original)
+
+    def new_synthetic() -> bytes:
+        nonlocal synthetic_ordinal, estimated
+        while True:
+            digest = hashlib.sha256(
+                config.seed.to_bytes(8, "little")
+                + b"synthetic-key"
+                + synthetic_ordinal.to_bytes(8, "little")
+            ).hexdigest()[:24].encode("ascii")
+            synthetic_ordinal += 1
+            candidate = b"~sib-mixed-" + digest
+            if candidate not in known_keys:
+                estimated += len(candidate) + 160
+                if estimated > limit:
+                    raise ResourceBudget("workload generation exceeds --memory-budget-mib")
+                known_keys.add(candidate)
+                return candidate
+
+    def choose_absent() -> bytes:
+        nonlocal peak_absent
+        if len(absent_original):
+            return absent_original.choose(target_rng)
+        if len(absent_synthetic):
+            return absent_synthetic.choose(target_rng)
+        candidate = new_synthetic()
+        absent_synthetic.add(candidate)
+        peak_absent = max(peak_absent, len(absent_original) + len(absent_synthetic))
+        return candidate
+
+    def next_value(previous: Optional[int] = None) -> int:
+        nonlocal generated_value_ordinal
+        if generated_value_ordinal == 0:
+            value = 0
+        elif generated_value_ordinal == 1:
+            value = UINT64_MAX
+        else:
+            value = value_rng.getrandbits(64)
+        generated_value_ordinal += 1
+        if previous is not None and value == previous:
+            value = UINT64_MAX if previous != UINT64_MAX else 0
+        return value
+
+    for kind in kinds:
+        name = OPERATION_NAMES[kind - 1]
+        ordinal = ordinals[name]
+        ordinals[name] += 1
+        value = 0
+        operation_limit = config.scan_length if name == "scan" else 0
+
+        if name == "find":
+            if ordinal in miss_find_ordinals or not len(live):
+                key = choose_absent()
+                outcomes["find_misses"] += 1
+            else:
+                key = live.choose(target_rng)
+                outcomes["find_hits"] += 1
+        elif name == "insert":
+            if counts[name] >= 2 and not duplicate_insert_done and len(live):
+                key = live.choose(target_rng)
+                value = next_value()
+                duplicate_insert_done = True
+                fixture_counts["intentional_duplicate_inserts"] += 1
+                outcomes["insert_already_exists"] += 1
+            else:
+                if len(absent_original):
+                    key = absent_original.pop_random(target_rng)
+                elif len(absent_synthetic):
+                    key = absent_synthetic.pop_random(target_rng)
+                else:
+                    key = new_synthetic()
+                value = next_value()
+                live.add(key)
+                live_values[key] = value
+                bisect.insort(ordered_live, key)
+                outcomes["insert_inserted"] += 1
+            insert_sources["original" if key in original_keys else "synthetic"] += 1
+        elif name == "update":
+            if counts[name] >= 2 and not missing_update_done:
+                key = choose_absent()
+                value = next_value()
+                missing_update_done = True
+                fixture_counts["intentional_missing_updates"] += 1
+                outcomes["update_not_found"] += 1
+            elif len(live):
+                key = live.choose(target_rng)
+                value = next_value(live_values[key])
+                live_values[key] = value
+                outcomes["update_updated"] += 1
+            else:
+                key = choose_absent()
+                value = next_value()
+                outcomes["update_not_found"] += 1
+        elif name == "erase":
+            if counts[name] >= 2 and not missing_erase_done:
+                key = choose_absent()
+                missing_erase_done = True
+                fixture_counts["intentional_missing_erases"] += 1
+                outcomes["erase_not_found"] += 1
+            elif len(live):
+                key = live.choose(target_rng)
+                live.remove(key)
+                del live_values[key]
+                ordered_live.pop(bisect.bisect_left(ordered_live, key))
+                (absent_original if key in original_keys else absent_synthetic).add(key)
+                outcomes["erase_erased"] += 1
+            else:
+                key = choose_absent()
+                outcomes["erase_not_found"] += 1
+        else:
+            if len(live):
+                key = live.choose(target_rng)
+            else:
+                key = choose_absent()
+            begin = bisect.bisect_left(ordered_live, key)
+            outcomes["scan_calls"] += 1
+            outcomes["scan_rows"] += min(operation_limit, len(ordered_live) - begin)
+
+        touched.add(key)
+        operations.append((kind, key, value, operation_limit))
+        peak_live = max(peak_live, len(live))
+        peak_absent = max(peak_absent, len(absent_original) + len(absent_synthetic))
+
+    metadata = config.metadata(len(operations))
+    metadata.update({
+        "actual_result_counts": outcomes,
+        "initial_key_count": len(initial_keys),
+        "held_out_key_count": len(held_out_keys),
+        "initial_content_sha256": _partition_digest(initial_keys, initial_values),
+        "held_out_content_sha256": _partition_digest(held_out_keys),
+        "initial_value_policy": "full-sorted-unique-source-rank",
+        "trace_value_policy": {
+            "scope": "insert/update payloads only; unrelated to initial ranks",
+            "stream": "operation-values",
+            "sequence": "first generated value 0; second UINT64_MAX; remaining values seeded uint64",
+            "update_collision": (
+                "replace an unchanged candidate with UINT64_MAX, or 0 when previous is UINT64_MAX"
+            ),
+        },
+        "insert_attempts": insert_sources,
+        "original_insert_attempts": insert_sources["original"],
+        "synthetic_insert_attempts": insert_sources["synthetic"],
+        "fixture_attempts": fixture_counts,
+        "final_key_count": len(live),
+        "touched_key_count": len(touched),
+        "actual_find_hits": outcomes["find_hits"],
+        "actual_find_misses": outcomes["find_misses"],
+        "peak_live_key_count": peak_live,
+        "peak_absent_key_count": peak_absent,
+        "estimated_memory_bytes": estimated,
+        "rng": {
+            "derivation": "SHA-256(seed uint64LE || ASCII stream label), full digest as Python Random seed",
+            "streams": ["operation-order", "initial-partition", "operation-targets", "operation-values"],
+        },
+        "selection": {
+            "initial": "seed-selected full-source ranks, then unsigned-byte order",
+            "live_absent": "bounded swap-remove pools; byte-sorted live scan index",
+            "find_miss_positions": "floor(find_count * read_miss_ratio), target-stream sample",
+        },
+    })
+    return PreparedMixedWorkload(initial_keys, initial_values, held_out_keys, operations, metadata)
