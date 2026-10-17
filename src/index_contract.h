@@ -53,6 +53,7 @@ struct Capabilities {
   Support erase = Support::unsupported;
   Support scan = Support::unsupported;
   Support range_sum = Support::unsupported;
+  bool concurrent_find = false;
 };
 
 struct Descriptor {

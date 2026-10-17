@@ -4,7 +4,7 @@
 
 项目定位是**数据集与字符串索引实现之间的评测层**：用户指定数据集位置和实现位置，运行统一脚本，得到详细评测结果。数据来源与实现均独立于本项目；我们负责接入、负载、正确性校验、公平测量和结果复现，不自行设计索引算法，也不对用户原始数据设统一键长或字节数上限。
 
-这两侧的规定已写入 [数据接入约定](docs/DATASET_CONTRACT.md) 和 [实现接口契约](docs/INDEX_CONTRACT.md)，实现接口的 C++17 签名在 [index_contract.h](src/index_contract.h)。**统一入口支持静态点查询**，可接入外部数据和 C++17 适配包，比较均匀、热点、Zipf 访问，并提供独立校验和详细报告。使用方式与当前边界见 [统一入口说明](docs/UNIFIED_BENCHMARK.md)，本周改进见 [2026-10-11 改进记录](docs/WEEKLY_UPDATE_2026-10-11.md)，上一版见 [2026-09-26 记录](docs/WEEKLY_UPDATE_2026-09-26.md)。完整目标见 [评测范围](docs/BENCHMARK.md#产品目标与两侧边界)。
+这两侧的规定已写入 [数据接入约定](docs/DATASET_CONTRACT.md) 和 [实现接口契约](docs/INDEX_CONTRACT.md)，实现接口的 C++17 签名在 [index_contract.h](src/index_contract.h)。**统一入口支持单线程与多线程静态点查询**，可接入外部数据和 C++17 适配包，比较均匀、热点、Zipf 访问，并提供独立校验和详细报告。使用方式与当前边界见 [统一入口说明](docs/UNIFIED_BENCHMARK.md)，本周改进见 [2026-10-17 改进记录](docs/WEEKLY_UPDATE_2026-10-17.md)，上一版见 [2026-10-11 记录](docs/WEEKLY_UPDATE_2026-10-11.md)。完整目标见 [评测范围](docs/BENCHMARK.md#产品目标与两侧边界)。
 
 ## 快速开始：统一入口
 
@@ -21,6 +21,26 @@ python3 -B scripts/benchmark.py \
 把数据和适配包路径换成自己的位置即可运行；输出目录必须尚不存在。先看生成的 `report.md` 中文报告，再按需查看 `report.json`、`summary.csv` 和 `samples.csv`。两个自带基线用于验证接入，完整参数见 `python3 -B scripts/benchmark.py --help` 和 [使用说明](docs/UNIFIED_BENCHMARK.md)。
 
 评测层还提供三份可直接使用的访问场景。把 `--workload examples/workloads/hotspot.json` 加入上述命令即可测热点访问；`uniform.json` 和 `zipf.json` 分别对应均匀和 Zipf 访问。三份配置使用相同的查询数、种子、未命中率和重复次数，便于在相同数据及实现上逐项对照。原始数据和索引源码无需修改。
+
+## 多线程只读与扩展性对照
+
+在统一入口加上 `--threads 1 2 4`，即可在同一数据和查询上测量共享索引实例的并发读取：
+
+```bash
+python3 -B scripts/benchmark.py \
+  --dataset examples/keys.txt \
+  --implementation adapters/std_map \
+  --implementation adapters/sorted_vector \
+  --workload examples/workloads/parallel-read.json \
+  --threads 1 2 4 \
+  --output results/parallel-read
+```
+
+每轮总操作数固定，各线程均分查询；每个适配器只编译一次，各配置依次运行。两个自带基线已声明并发读取能力，外部实现需显式设置 `concurrent_find = true`；未声明的实现仍能单线程运行，并行组合记为 `unsupported`。`--threads` 控制查询线程，`--jobs` 控制编译并行度。
+
+`report.md`、`summary.csv` 和新增的 `scaling.csv` 给出吞吐量、相对单线程的加速比和并行效率；`workers.csv` 保留逐线程操作数与计时。延迟来自独立单线程抽样，不代表并发尾延迟。本次支持静态并发读取，写入与读写混合语义另行接入。完整口径、接入例子和限制见 [并行评测说明](docs/PARALLEL_BENCHMARK.md)。
+
+两个同学的现有模型适配包也已完成固定版本的静态查询接入实测，接入方式与并发边界见 [同学实现接入说明](docs/TEAMMATE_INTEGRATION.md)；源码核对见 [兼容性报告](docs/TEAMMATE_COMPATIBILITY_2026-10-17.md)。三类真实键 × 三种访问分布的基线扩展性结果保留在 [结果 CSV](docs/experiments/parallel-read-2026-10-17.csv)。
 
 ## 旧 TLI 开发入口
 

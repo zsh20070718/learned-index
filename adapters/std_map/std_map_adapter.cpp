@@ -46,6 +46,7 @@ class StdMapIndex final : public string_index_bench::v1::Index {
     descriptor.capabilities.bulk_load =
         string_index_bench::v1::Support::adapted;
     descriptor.capabilities.find = string_index_bench::v1::Support::native;
+    descriptor.capabilities.concurrent_find = true;
     descriptor.adaptation_notes =
         "bulk_load is adapted by inserting each sorted input row into "
         "std::map with emplace; all insertion work is included in build time.";

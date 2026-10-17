@@ -17,6 +17,7 @@ from .errors import BuildFailure, InputError, RunFailure
 MANIFEST_NAME = "benchmark-adapter.json"
 CONTRACT = "string-index/v1"
 RUN_SCHEMA = "string-index-static-run/v1"
+PARALLEL_RUN_SCHEMA = "string-index-static-run/v2"
 RUN_STATUSES = {"passed", "skipped", "unsupported", "invalid_input", "failed"}
 SUCCESS_STATUSES = {"passed", "skipped", "unsupported"}
 FAILURE_STATUSES = {"invalid_input", "failed"}
@@ -72,6 +73,39 @@ def _sha256_file(path: Path) -> Optional[str]:
         return None
 
 
+def _source_git_identity(source_dir: Path) -> Dict[str, Any]:
+    """Best-effort tracked-source identity, without refreshing another checkout."""
+    result = {
+        "commit": None,
+        "tracked_dirty": None,
+        "scope": "tracked files below adapter source_dir; excludes untracked files and external dependencies",
+    }  # type: Dict[str, Any]
+    git = shutil.which("git")
+    if git is None:
+        return result
+    command = [git, "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", str(source_dir)]
+    try:
+        revision = subprocess.run(
+            command + ["rev-parse", "--verify", "HEAD"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=2, check=False,
+        )
+        commit = revision.stdout.strip()
+        if revision.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+            return result
+        result["commit"] = commit
+        changed = subprocess.run(
+            command + ["diff", "--quiet", "HEAD", "--", "."],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=2, check=False,
+        )
+        if changed.returncode in (0, 1):
+            result["tracked_dirty"] = changed.returncode == 1
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return result
+
+
 def initial_build_identity(
     manifest: Optional[AdapterManifest], repository_root: Path, requested: Optional[Path] = None
 ) -> Dict[str, Any]:
@@ -90,7 +124,10 @@ def initial_build_identity(
         "schema": "string-index-build-identity/v1",
         "adapter_manifest_sha256": _sha256_file(manifest_path),
         "runner_harness_sha256": _sha256_file(repository_root / "src/unified/runner.cpp"),
+        "runner_header_sha256": _sha256_file(repository_root / "src/unified/runner.h"),
+        "index_contract_sha256": _sha256_file(repository_root / "src/index_contract.h"),
         "adapter_declared_source_identity": declared_identity,
+        "external_source_git": _source_git_identity(manifest.source_dir) if manifest else None,
         "external_source_tree_sha256": None,
         "external_source_identity_note": (
             "External source trees are not recursively hashed; provide immutable "
@@ -251,6 +288,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL \"\" FORCE)
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL \"\" FORCE)
 set(STRING_INDEX_CONTRACT_INCLUDE_DIR {include} CACHE PATH \"\" FORCE)
+find_package(Threads REQUIRED)
 add_subdirectory({source} adapter-build)
 if(NOT TARGET {target})
   message(FATAL_ERROR \"adapter did not define its declared target\")
@@ -260,7 +298,7 @@ target_include_directories(string_index_static_runner PRIVATE {include})
 target_compile_definitions(string_index_static_runner PRIVATE
   SIB_ADAPTER_FACTORY_HEADER=\\\"{header}\\\"
   SIB_ADAPTER_FACTORY_SYMBOL={symbol})
-target_link_libraries(string_index_static_runner PRIVATE {target})
+target_link_libraries(string_index_static_runner PRIVATE {target} Threads::Threads)
 """.format(
         source=source,
         target=manifest.cmake_target,
@@ -395,7 +433,7 @@ def _finite_positive(value: Any, location: str) -> float:
     return result
 
 
-def _validate_descriptor(value: Any, completed: bool) -> None:
+def _validate_descriptor(value: Any, completed: bool, parallel_schema: bool = False) -> None:
     if value is None:
         if completed:
             raise RunFailure("passed runner result is missing descriptor evidence")
@@ -425,7 +463,7 @@ def _validate_descriptor(value: Any, completed: bool) -> None:
         raise RunFailure("passed runner result has incomplete descriptor evidence")
     capabilities = _exact_object(
         descriptor["capabilities"],
-        {
+        ({"concurrent_find"} if parallel_schema else set()) | {
             "keys",
             "max_value",
             "bulk_load",
@@ -457,6 +495,8 @@ def _validate_descriptor(value: Any, completed: bool) -> None:
         if not isinstance(keys[name], bool):
             raise RunFailure("runner result descriptor key domain has an invalid flag")
     _uint(capabilities["max_value"], "descriptor max_value")
+    if parallel_schema and not isinstance(capabilities["concurrent_find"], bool):
+        raise RunFailure("runner result concurrent_find capability is not boolean")
     supports = []
     for name in ("bulk_load", "find", "insert", "update", "erase", "scan", "range_sum"):
         if not isinstance(capabilities[name], str):
@@ -503,6 +543,7 @@ def parse_runner_result(
     expected_latency_samples: Optional[int] = None,
     expected_rows: Optional[int] = None,
     returncode: Optional[int] = None,
+    expected_threads: int = 1,
 ) -> Dict[str, Any]:
     try:
         raw = json.loads(
@@ -512,9 +553,10 @@ def parse_runner_result(
         )
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         raise RunFailure("runner result is missing or malformed")
+    parallel_schema = isinstance(raw, dict) and raw.get("schema") == PARALLEL_RUN_SCHEMA
     raw = _exact_object(
         raw,
-        {
+        ({"execution"} if parallel_schema else set()) | {
             "schema",
             "status",
             "stage",
@@ -528,10 +570,25 @@ def parse_runner_result(
         },
         "top-level object",
     )
-    if raw["schema"] != RUN_SCHEMA:
+    if raw["schema"] not in (RUN_SCHEMA, PARALLEL_RUN_SCHEMA):
         raise RunFailure("runner result has an unsupported schema")
+    if parallel_schema:
+        execution = _exact_object(
+            raw["execution"], {"threads", "mode", "partition", "latency_mode"}, "execution"
+        )
+        threads = _uint(execution["threads"], "execution threads", positive=True)
+        if threads != expected_threads or threads > 256:
+            raise RunFailure("runner result has an incorrect thread count")
+        if (
+            execution["mode"] != ("serial" if threads == 1 else "shared-index-read-only")
+            or execution["partition"] != "contiguous-balanced"
+            or execution["latency_mode"] != "separate-single-thread"
+        ):
+            raise RunFailure("runner result has inconsistent execution semantics")
+    elif expected_threads != 1:
+        raise RunFailure("v1 runner cannot certify parallel execution")
     status = raw["status"]
-    if status not in RUN_STATUSES:
+    if not isinstance(status, str) or status not in RUN_STATUSES:
         raise RunFailure("runner result has an invalid status")
     if not isinstance(raw["stage"], str) or not raw["stage"]:
         raise RunFailure("runner result stage has an invalid type")
@@ -547,11 +604,11 @@ def parse_runner_result(
         if returncode not in (0, 1) or status not in expected_statuses:
             raise RunFailure("runner exit code and structured status are inconsistent")
 
-    _validate_descriptor(raw["descriptor"], completed)
+    _validate_descriptor(raw["descriptor"], completed, parallel_schema)
     _validate_memory(raw["memory"], completed)
     validation = _exact_object(
         raw["validation"],
-        {
+        ({"concurrent_find_checked", "concurrent_queries_checked"} if parallel_schema else set()) | {
             "descriptor_checked",
             "capability_domain_checked",
             "empty_build_checked",
@@ -575,6 +632,10 @@ def parse_runner_result(
             raise RunFailure("runner result validation evidence has an invalid flag")
     rows_checked = _uint(validation["rows_checked"], "validation rows_checked")
     queries_checked = _uint(validation["queries_checked"], "validation queries_checked")
+    if parallel_schema:
+        if not isinstance(validation["concurrent_find_checked"], bool):
+            raise RunFailure("runner result concurrent validation flag is not boolean")
+        _uint(validation["concurrent_queries_checked"], "concurrent_queries_checked")
 
     if not isinstance(raw["samples"], list) or not isinstance(raw["latency_samples"], list):
         raise RunFailure("runner result measurement fields must be arrays")
@@ -590,6 +651,16 @@ def parse_runner_result(
     assert expected_operations is not None
     assert expected_latency_samples is not None
     assert expected_rows is not None
+    if parallel_schema:
+        parallel = expected_threads > 1
+        if expected_threads > expected_operations:
+            raise RunFailure("passed runner result has more workers than operations")
+        if (
+            validation["concurrent_find_checked"] != parallel
+            or validation["concurrent_queries_checked"] != (expected_operations if parallel else 0)
+            or (parallel and not raw["descriptor"]["capabilities"]["concurrent_find"])
+        ):
+            raise RunFailure("passed runner result lacks concurrent correctness evidence")
     if not all(validation[name] for name in (
         "descriptor_checked",
         "capability_domain_checked",
@@ -608,7 +679,7 @@ def parse_runner_result(
     for repeat, sample_value in enumerate(raw["samples"]):
         sample = _exact_object(
             sample_value,
-            {
+            ({"workers"} if parallel_schema else set()) | {
                 "repeat",
                 "build_ns",
                 "latency_build_ns",
@@ -636,6 +707,25 @@ def parse_runner_result(
         expected_throughput = operations * 1.0e9 / lookup_ns
         if not math.isclose(throughput, expected_throughput, rel_tol=1e-12, abs_tol=0.0):
             raise RunFailure("passed runner result has inconsistent throughput")
+        if parallel_schema:
+            workers = sample["workers"]
+            if not isinstance(workers, list) or len(workers) != expected_threads:
+                raise RunFailure("passed runner result has an incorrect worker count")
+            quotient, remainder = divmod(expected_operations, expected_threads)
+            for worker_index, worker_value in enumerate(workers):
+                worker = _exact_object(
+                    worker_value, {"worker", "operations", "lookup_ns", "checksum"}, "worker"
+                )
+                if (
+                    _uint(worker["worker"], "worker index") != worker_index
+                    or _uint(worker["operations"], "worker operations", positive=True)
+                    != quotient + (worker_index < remainder)
+                ):
+                    raise RunFailure("passed runner result has an incorrect worker partition")
+                worker_ns = _uint(worker["lookup_ns"], "worker lookup_ns")
+                if worker_ns > lookup_ns:
+                    raise RunFailure("worker duration exceeds total wall time")
+                _uint(worker["checksum"], "worker checksum")
 
     expected_latency_count = expected_repeats * per_repeat_latency
     if len(raw["latency_samples"]) != expected_latency_count:
@@ -679,6 +769,7 @@ def invoke_runner(
     repeats: int,
     latency_samples: int,
     run_timeout: int,
+    threads: int = 1,
 ) -> Dict[str, Any]:
     expected_rows = _interchange_count(rows_path, b"SIBROW1\0", "rows")
     expected_operations = _interchange_count(
@@ -701,6 +792,8 @@ def invoke_runner(
         str(repeats),
         "--latency-samples",
         str(latency_samples),
+        "--threads",
+        str(threads),
     ]
     try:
         completed = subprocess.run(
@@ -725,4 +818,5 @@ def invoke_runner(
         expected_latency_samples=latency_samples,
         expected_rows=expected_rows,
         returncode=completed.returncode,
+        expected_threads=threads,
     )

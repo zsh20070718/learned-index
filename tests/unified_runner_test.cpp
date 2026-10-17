@@ -3,6 +3,8 @@
 #include "std_map_adapter.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -10,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -97,15 +100,22 @@ enum class Fault {
   key_bearing_exception,
   finite_full_domain,
   factory_exception,
+  concurrent_ok,
+  concurrent_wrong_value,
+  concurrent_exception,
 };
 
 Fault active_fault = Fault::none;
 std::size_t factory_calls = 0;
 std::size_t bulk_load_calls = 0;
+std::size_t expected_parallel_workers = 2;
+std::atomic<bool> parallel_overlap_observed{false};
+std::atomic<bool> parallel_completion_observed{false};
 
 class FaultIndex final : public Index {
  public:
-  explicit FaultIndex(Fault fault) : fault_(fault) {}
+  FaultIndex(Fault fault, std::size_t instance)
+      : fault_(fault), instance_(instance) {}
 
   Descriptor descriptor() const override {
     Descriptor descriptor;
@@ -114,6 +124,10 @@ class FaultIndex final : public Index {
     descriptor.adapter_version = "test-adapter-v1";
     descriptor.capabilities.bulk_load = Support::native;
     descriptor.capabilities.find = Support::native;
+    descriptor.capabilities.concurrent_find =
+        fault_ == Fault::concurrent_ok ||
+        fault_ == Fault::concurrent_wrong_value ||
+        fault_ == Fault::concurrent_exception;
     if (fault_ == Fault::invalid_descriptor) {
       descriptor.capabilities.keys.min_bytes = 4;
       descriptor.capabilities.keys.max_bytes = 2;
@@ -154,6 +168,35 @@ class FaultIndex final : public Index {
     if (fault_ == Fault::key_bearing_exception) {
       throw std::runtime_error("private adapter detail for key=" +
                                std::string(key));
+    }
+    const bool parallel_fault =
+        fault_ == Fault::concurrent_ok ||
+        fault_ == Fault::concurrent_wrong_value ||
+        fault_ == Fault::concurrent_exception;
+    if (parallel_fault && instance_ == 4) {
+      std::unique_lock<std::mutex> lock(parallel_mutex_);
+      if (!parallel_released_) {
+        ++parallel_waiting_;
+        if (parallel_waiting_ == expected_parallel_workers) {
+          parallel_overlap_observed = true;
+          parallel_released_ = true;
+          parallel_condition_.notify_all();
+        } else {
+          parallel_condition_.wait(lock, [&] { return parallel_released_; });
+        }
+      }
+      lock.unlock();
+      if (fault_ == Fault::concurrent_exception && key.empty()) {
+        throw std::runtime_error(
+            "private concurrent adapter detail for the empty key");
+      }
+      if (fault_ == Fault::concurrent_wrong_value) {
+        return UINT64_C(0xfeedface);
+      }
+      if (fault_ == Fault::concurrent_exception &&
+          key == std::string_view("\x80", 1)) {
+        parallel_completion_observed = true;
+      }
     }
     const auto found = std::find_if(rows_.begin(), rows_.end(),
                                     [key](const Row& row) {
@@ -203,8 +246,13 @@ class FaultIndex final : public Index {
 
  private:
   Fault fault_;
+  std::size_t instance_;
   bool loaded_ = false;
   std::vector<Row> rows_;
+  mutable std::mutex parallel_mutex_;
+  mutable std::condition_variable parallel_condition_;
+  mutable std::size_t parallel_waiting_ = 0;
+  mutable bool parallel_released_ = false;
 };
 
 std::unique_ptr<Index> make_fault_index(const Parameters&) {
@@ -212,7 +260,7 @@ std::unique_ptr<Index> make_fault_index(const Parameters&) {
   if (active_fault == Fault::factory_exception) {
     throw std::runtime_error("injected factory failure");
   }
-  return std::make_unique<FaultIndex>(active_fault);
+  return std::make_unique<FaultIndex>(active_fault, factory_calls);
 }
 
 std::vector<Row> boundary_rows() {
@@ -232,13 +280,14 @@ std::vector<Query> boundary_queries() {
 }
 
 RunReport run_fault(Fault fault, std::size_t repeats = 1,
-                    std::size_t latency_samples = 2) {
+                    std::size_t latency_samples = 2,
+                    std::size_t threads = 1) {
   active_fault = fault;
   factory_calls = 0;
   bulk_load_calls = 0;
   return string_index_bench::unified::run_static_lookup(
       &make_fault_index, {}, boundary_rows(), boundary_queries(), repeats,
-      latency_samples);
+      latency_samples, threads);
 }
 
 void test_interchange() {
@@ -372,8 +421,13 @@ void test_correctness_and_measurement() {
 
   std::ostringstream json;
   string_index_bench::unified::write_result_json(json, normal);
-  check(json.str().find("string-index-static-run/v1") != std::string::npos,
+  check(json.str().find("string-index-static-run/v2") != std::string::npos,
         "result JSON carries the frozen schema");
+  check(json.str().find("\"execution\": {\"threads\": 1") !=
+            std::string::npos &&
+            json.str().find("\"concurrent_find\": false") !=
+                std::string::npos,
+        "serial result JSON carries explicit execution and capability data");
   check(json.str().find("latency_build_ns") != std::string::npos,
         "fresh latency build timing is emitted");
   check(json.str().find(std::string("a\0", 2)) == std::string::npos,
@@ -506,6 +560,109 @@ void test_correctness_and_measurement() {
         "query expectations are checked against an independent oracle");
 }
 
+void reset_parallel_fixture(Fault fault, std::size_t workers = 2) {
+  active_fault = fault;
+  factory_calls = 0;
+  bulk_load_calls = 0;
+  expected_parallel_workers = workers;
+  parallel_overlap_observed = false;
+  parallel_completion_observed = false;
+}
+
+void test_parallel_execution() {
+  const RunReport default_serial = run_fault(Fault::none, 1, 0);
+  check(default_serial.status == "passed" &&
+            default_serial.execution.threads == 1 &&
+            default_serial.execution.mode == "serial" &&
+            !default_serial.validation.concurrent_find_checked &&
+            default_serial.validation.concurrent_queries_checked == 0 &&
+            default_serial.samples.size() == 1 &&
+            default_serial.samples.front().workers.size() == 1 &&
+            default_serial.samples.front().workers.front().operations ==
+                boundary_queries().size(),
+        "omitted thread count retains the direct one-thread execution path");
+
+  active_fault = Fault::none;
+  factory_calls = 0;
+  bulk_load_calls = 0;
+  const RunReport unsupported = string_index_bench::unified::run_static_lookup(
+      &make_fault_index, {}, boundary_rows(), boundary_queries(), 1, 0, 2);
+  check(unsupported.status == "unsupported" &&
+            unsupported.stage == "capability" && bulk_load_calls == 0 &&
+            unsupported.samples.empty() && unsupported.latency_samples.empty() &&
+            unsupported.checksum == 0,
+        "parallel execution rejects adapters without concurrent-find support");
+
+  for (const std::size_t invalid_threads : {std::size_t{0},
+                                             std::size_t{257},
+                                             std::size_t{6}}) {
+    factory_calls = 0;
+    const RunReport invalid = string_index_bench::unified::run_static_lookup(
+        &make_fault_index, {}, boundary_rows(), boundary_queries(), 1, 0,
+        invalid_threads);
+    check(invalid.status == "invalid_input" &&
+              invalid.stage == "execution" && factory_calls == 0 &&
+              invalid.execution.threads == invalid_threads &&
+              invalid.samples.empty() && invalid.latency_samples.empty() &&
+              invalid.checksum == 0,
+          "invalid thread count is rejected before adapter construction");
+  }
+
+  reset_parallel_fixture(Fault::concurrent_ok);
+  const RunReport parallel = string_index_bench::unified::run_static_lookup(
+      &make_fault_index, {}, boundary_rows(), boundary_queries(), 1, 0, 2);
+  check(parallel.status == "passed",
+        "parallel-capable fixture passes: " + parallel.reason);
+  check(parallel_overlap_observed &&
+            parallel.validation.concurrent_find_checked &&
+            parallel.validation.concurrent_queries_checked ==
+                boundary_queries().size(),
+        "parallel correctness validation performs overlapping shared-index reads");
+  check(parallel.execution.threads == 2 &&
+            parallel.execution.mode == "shared-index-read-only" &&
+            parallel.execution.partition == "contiguous-balanced" &&
+            parallel.execution.latency_mode == "separate-single-thread" &&
+            parallel.samples.size() == 1 &&
+            parallel.samples.front().workers.size() == 2 &&
+            parallel.samples.front().workers[0].worker == 0 &&
+            parallel.samples.front().workers[0].operations == 3 &&
+            parallel.samples.front().workers[1].worker == 1 &&
+            parallel.samples.front().workers[1].operations == 2,
+        "uneven query counts use ordered contiguous balanced partitions");
+  std::ostringstream parallel_json;
+  string_index_bench::unified::write_result_json(parallel_json, parallel);
+  check(parallel_json.str().find("string-index-static-run/v2") !=
+            std::string::npos &&
+            parallel_json.str().find("\"mode\": \"shared-index-read-only\"") !=
+                std::string::npos &&
+            parallel_json.str().find("\"concurrent_find_checked\": true") !=
+                std::string::npos &&
+            parallel_json.str().find("\"workers\": [{\"worker\": 0, \"operations\": 3") !=
+                std::string::npos,
+        "parallel JSON emits strict v2 execution, validation, and worker evidence");
+
+  reset_parallel_fixture(Fault::concurrent_exception);
+  const RunReport exception = string_index_bench::unified::run_static_lookup(
+      &make_fault_index, {}, boundary_rows(), boundary_queries(), 1, 0, 2);
+  check(exception.status == "failed" && exception.stage == "correctness" &&
+            exception.reason.find("adapter find call failed") !=
+                std::string::npos &&
+            exception.reason.find("private concurrent adapter detail") ==
+                std::string::npos &&
+            parallel_completion_observed && exception.samples.empty() &&
+            exception.latency_samples.empty() && exception.checksum == 0,
+        "parallel exceptions are redacted and all launched workers are joined");
+
+  reset_parallel_fixture(Fault::concurrent_wrong_value);
+  const RunReport wrong = string_index_bench::unified::run_static_lookup(
+      &make_fault_index, {}, boundary_rows(), boundary_queries(), 1, 0, 2);
+  check(wrong.status == "failed" && wrong.stage == "correctness" &&
+            wrong.reason.find("wrong value") != std::string::npos &&
+            parallel_overlap_observed && wrong.samples.empty() &&
+            wrong.latency_samples.empty() && wrong.checksum == 0,
+        "synchronized correctness validation catches concurrency-only errors");
+}
+
 void expect_optional_unsupported(Index* index) {
   expect_throw_contains([index] { (void)index->insert("x", 1); }, "unsupported",
                         "insert reports unsupported");
@@ -528,6 +685,8 @@ void test_adapters() {
     check(report.descriptor &&
               report.descriptor->capabilities.find == Support::native,
           "baseline adapter declares native find");
+    check(report.descriptor && report.descriptor->capabilities.concurrent_find,
+          "baseline adapter opts into concurrent shared-index find");
     check(report.descriptor &&
               report.descriptor->capabilities.insert == Support::unsupported &&
               report.descriptor->capabilities.update == Support::unsupported &&
@@ -555,6 +714,15 @@ void test_adapters() {
         },
         "duplicate parameter",
         "baseline adapter rejects duplicate parameters before unknowns");
+
+    const RunReport parallel_report =
+        string_index_bench::unified::run_static_lookup(
+            factory, {}, boundary_rows(), boundary_queries(), 1, 0, 2);
+    check(parallel_report.status == "passed" &&
+              parallel_report.validation.concurrent_find_checked &&
+              parallel_report.samples.front().workers.size() == 2,
+          "baseline adapter passes shared-index parallel lookup: " +
+              parallel_report.reason);
   }
 
   const auto std_map = make_std_map_index({})->descriptor();
@@ -591,11 +759,16 @@ std::string read_text_file(const std::filesystem::path& path) {
 int invoke_cli(const std::filesystem::path& rows,
                const std::filesystem::path& queries,
                const std::filesystem::path& result,
-               const std::filesystem::path& samples) {
+               const std::filesystem::path& samples,
+               const std::string& threads = "") {
   std::vector<std::string> arguments = {
       "unified-test-runner", "--rows", rows.string(), "--queries",
       queries.string(),      "--result", result.string(), "--samples",
       samples.string(),      "--repeats", "2", "--latency-samples", "3"};
+  if (!threads.empty()) {
+    arguments.push_back("--threads");
+    arguments.push_back(threads);
+  }
   std::vector<char*> argv;
   argv.reserve(arguments.size());
   for (auto& argument : arguments) {
@@ -617,6 +790,10 @@ void test_cli(const std::filesystem::path& executable_path) {
       output_dir / "unified-runner-test-invalid-result.json";
   const auto invalid_samples_path =
       output_dir / "unified-runner-test-invalid-samples.csv";
+  const auto parallel_result_path =
+      output_dir / "unified-runner-test-parallel-result.json";
+  const auto parallel_samples_path =
+      output_dir / "unified-runner-test-parallel-samples.csv";
   const auto collision_path =
       output_dir / "unified-runner-test-collision-output";
   const auto collision_directory =
@@ -637,6 +814,24 @@ void test_cli(const std::filesystem::path& executable_path) {
     check(samples.find("throughput") != std::string::npos &&
               samples.find("latency") != std::string::npos,
           "CLI emits raw throughput and latency samples");
+
+    reset_parallel_fixture(Fault::concurrent_ok);
+    check(invoke_cli(rows_path, queries_path, parallel_result_path,
+                     parallel_samples_path, "2") == 0,
+          "CLI accepts an explicit parallel thread count");
+    const std::string parallel_result = read_text_file(parallel_result_path);
+    check(parallel_result.find("\"threads\": 2") != std::string::npos &&
+              parallel_result.find("\"mode\": \"shared-index-read-only\"") !=
+                  std::string::npos &&
+              parallel_result.find("\"workers\": [{\"worker\": 0") !=
+                  std::string::npos,
+          "CLI carries the requested parallel execution into v2 JSON");
+    active_fault = Fault::none;
+
+    check(invoke_cli(rows_path, queries_path, collision_path,
+                     parallel_samples_path, "0") == 2 &&
+              !std::filesystem::exists(collision_path),
+          "CLI rejects a thread count outside the supported range");
 
     check(invoke_cli(rows_path, queries_path, result_path, samples_path) == 2,
           "CLI rejects existing output paths before opening them");
@@ -682,7 +877,8 @@ void test_cli(const std::filesystem::path& executable_path) {
 
   for (const auto& path : {rows_path, queries_path, malformed_path, result_path,
                            samples_path, invalid_result_path,
-                           invalid_samples_path, collision_path}) {
+                           invalid_samples_path, parallel_result_path,
+                           parallel_samples_path, collision_path}) {
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
   }
@@ -697,6 +893,7 @@ void test_cli(const std::filesystem::path& executable_path) {
 int main(int argc, char** argv) {
   test_interchange();
   test_correctness_and_measurement();
+  test_parallel_execution();
   test_adapters();
   if (argc > 0) {
     test_cli(std::filesystem::absolute(argv[0]));

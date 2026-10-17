@@ -2,7 +2,10 @@
 """Focused checks for the unified Python benchmark boundary."""
 
 import csv
+import copy
+import contextlib
 import hashlib
+import io
 import json
 import struct
 import subprocess
@@ -21,10 +24,12 @@ import benchmark  # noqa: E402
 import benchmark_lib.dataset as dataset_module  # noqa: E402
 from benchmark_lib.adapters import (  # noqa: E402
     RUN_SCHEMA,
+    PARALLEL_RUN_SCHEMA,
     initial_build_identity,
     invoke_runner,
     load_manifest,
     parse_runner_result,
+    _source_git_identity,
 )
 from benchmark_lib.dataset import (  # noqa: E402
     LOGICAL_DOMAIN,
@@ -40,7 +45,7 @@ from benchmark_lib.interchange import (  # noqa: E402
     write_rows,
 )
 from benchmark_lib.readers import iter_keys  # noqa: E402
-from benchmark_lib.reports import SUMMARY_FIELDS, summary_row, write_reports  # noqa: E402
+from benchmark_lib.reports import SUMMARY_FIELDS, scaling_summaries, summary_row, write_reports  # noqa: E402
 from benchmark_lib.workload import (  # noqa: E402
     POINT_SCHEMA,
     SCHEMA,
@@ -167,6 +172,189 @@ def failed_runner_payload(status: str = "failed") -> dict:
         }
     )
     return payload
+
+
+def parallel_runner_payload(threads: int = 2, operations: int = 3) -> dict:
+    payload = passed_runner_payload(operations=operations)
+    payload["schema"] = PARALLEL_RUN_SCHEMA
+    payload["execution"] = {
+        "threads": threads,
+        "mode": "serial" if threads == 1 else "shared-index-read-only",
+        "partition": "contiguous-balanced",
+        "latency_mode": "separate-single-thread",
+    }
+    payload["descriptor"]["capabilities"]["concurrent_find"] = True
+    payload["validation"].update({
+        "concurrent_find_checked": threads > 1,
+        "concurrent_queries_checked": operations if threads > 1 else 0,
+    })
+    quotient, remainder = divmod(operations, threads)
+    for sample in payload["samples"]:
+        sample["workers"] = [
+            {"worker": worker, "operations": quotient + (worker < remainder),
+             "lookup_ns": 8, "checksum": worker}
+            for worker in range(threads)
+        ]
+    return payload
+
+
+class ParallelBoundaryTests(unittest.TestCase):
+    def test_v2_parser_accepts_serial_parallel_and_uneven_partitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            for threads in (1, 2, 3):
+                with self.subTest(threads=threads):
+                    payload = parallel_runner_payload(threads)
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    self.assertEqual(parse_runner_result(path, 2, 3, 1, 2, 0, threads), payload)
+
+    def test_v2_parser_rejects_fabricated_concurrent_evidence(self) -> None:
+        cases = [
+            ("wrong threads", lambda p: p["execution"].update(threads=3)),
+            ("wrong mode", lambda p: p["execution"].update(mode="serial")),
+            ("wrong latency", lambda p: p["execution"].update(latency_mode="under-load")),
+            ("missing capability", lambda p: p["descriptor"]["capabilities"].update(concurrent_find=False)),
+            ("capability type", lambda p: p["descriptor"]["capabilities"].update(concurrent_find=1)),
+            ("unchecked", lambda p: p["validation"].update(concurrent_find_checked=False)),
+            ("wrong checked count", lambda p: p["validation"].update(concurrent_queries_checked=2)),
+            ("missing worker", lambda p: p["samples"][0]["workers"].pop()),
+            ("duplicate worker", lambda p: p["samples"][0]["workers"][1].update(worker=0)),
+            ("uneven partition", lambda p: p["samples"][0]["workers"][0].update(operations=1)),
+            ("bool operations", lambda p: p["samples"][0]["workers"][1].update(operations=True)),
+            ("negative time", lambda p: p["samples"][0]["workers"][0].update(lookup_ns=-1)),
+            ("oversized time", lambda p: p["samples"][0]["workers"][0].update(lookup_ns=11)),
+            ("bad checksum", lambda p: p["samples"][0]["workers"][0].update(checksum=1 << 64)),
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            for name, mutate in cases:
+                with self.subTest(name=name):
+                    payload = parallel_runner_payload()
+                    mutate(payload)
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaises(RunFailure):
+                        parse_runner_result(path, 2, 3, 1, 2, 0, 2)
+
+    def test_v1_result_cannot_certify_multiple_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            path.write_text(json.dumps(passed_runner_payload()), encoding="utf-8")
+            with self.assertRaisesRegex(RunFailure, "v1.*parallel"):
+                parse_runner_result(path, 2, 3, 1, 2, 0, 2)
+
+    def test_non_string_status_is_a_classified_runner_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            for status in ([], {}, None, True, 1):
+                with self.subTest(status=status):
+                    payload = parallel_runner_payload()
+                    payload["status"] = status
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaisesRegex(RunFailure, "invalid status"):
+                        parse_runner_result(path, 2, 3, 1, 2, 0, 2)
+
+    def test_failed_parallel_run_retains_safe_status_without_measurements(self) -> None:
+        payload = parallel_runner_payload()
+        payload.update(status="unsupported", stage="capability", reason="concurrent find unsupported",
+                       samples=[], latency_samples=[], checksum=0)
+        payload["descriptor"]["capabilities"]["concurrent_find"] = False
+        payload["validation"].update(concurrent_find_checked=False, concurrent_queries_checked=0)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(parse_runner_result(path, 2, 3, 1, 2, 0, 2), payload)
+            payload["samples"] = parallel_runner_payload()["samples"]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(RunFailure, "measurements"):
+                parse_runner_result(path, 2, 3, 1, 2, 0, 2)
+
+    def test_thread_matrix_builds_once_and_continues_after_run_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = load_manifest(make_manifest(root / "adapter"))
+            identity = initial_build_identity(manifest, ROOT)
+            with mock.patch.object(benchmark, "build_runner", return_value=(root / "runner", identity)) as build, \
+                 mock.patch.object(benchmark, "invoke_runner", side_effect=[
+                     parallel_runner_payload(1), RunFailure("runner timed out"), parallel_runner_payload(3)
+                 ]) as run:
+                results = benchmark._run_implementation(
+                    manifest, 1, root / "output", root / "rows", root / "queries",
+                    2, 1, 30, 30, 1, [1, 2, 3],
+                )
+            build.assert_called_once()
+            self.assertEqual([r["status"] for r in results], ["passed", "failed", "passed"])
+            self.assertEqual([r["threads"] for r in results], [1, 2, 3])
+            self.assertTrue(all(r["build_identity"] == identity for r in results))
+            for n, call in enumerate(run.call_args_list, 1):
+                self.assertEqual(call.args[1:3], (root / "rows", root / "queries"))
+                self.assertEqual(call.kwargs["threads"], n)
+
+    def test_build_failure_has_every_requested_thread_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = load_manifest(make_manifest(root / "adapter"))
+            with mock.patch.object(benchmark, "build_runner", side_effect=BuildFailure("unavailable")), \
+                 mock.patch.object(benchmark, "invoke_runner") as run:
+                results = benchmark._run_implementation(
+                    manifest, 1, root / "output", root / "r", root / "q", 1, 1, 1, 1, 1, [1, 4]
+                )
+            self.assertEqual([(r["threads"], r["stage"]) for r in results], [(1, "build"), (4, "build")])
+            run.assert_not_called()
+
+    def test_thread_arguments_reject_duplicates_zero_and_excess(self) -> None:
+        for counts in (["1", "1"], ["0"], ["257"]):
+            with self.subTest(counts=counts), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    benchmark.main(["--dataset", "missing", "--implementation", "missing", "--threads", *counts])
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_global_input_failure_preserves_sorted_thread_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = make_manifest(root / "adapter")
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = benchmark.main(["--dataset", str(root / "missing.txt"),
+                    "--implementation", str(manifest), "--output", str(root / "out"), "--threads", "4", "1", "2"])
+            self.assertEqual(code, 2)
+            report = json.loads((root / "out/report.json").read_text())
+            self.assertEqual(report["config"]["threads"], [1, 2, 4])
+            self.assertEqual([r["threads"] for r in report["results"]], [1, 2, 4])
+            self.assertTrue(all(r["status"] == "invalid_input" for r in report["results"]))
+            self.assertTrue((root / "out/scaling.csv").is_file())
+
+    def test_scaling_requires_passed_matching_single_thread_baseline(self) -> None:
+        baseline = {"implementation_id": "index", "threads": 1, "status": "passed",
+                    "runner_result": parallel_runner_payload(1)}
+        parallel = {"implementation_id": "index", "threads": 2, "status": "passed",
+                    "runner_result": parallel_runner_payload(2)}
+        for sample in parallel["runner_result"]["samples"]:
+            sample["throughput_ops_per_second"] *= 1.8
+        summaries = scaling_summaries([parallel, baseline])
+        self.assertAlmostEqual(summaries[0]["speedup_vs_1_thread"], 1.8)
+        self.assertAlmostEqual(summaries[0]["parallel_efficiency"], .9)
+        self.assertEqual(summaries[1]["speedup_vs_1_thread"], 1)
+        self.assertEqual(scaling_summaries([parallel])[0]["speedup_vs_1_thread"], "")
+        failed_baseline = dict(baseline, status="failed")
+        self.assertEqual(scaling_summaries([parallel, failed_baseline])[0]["speedup_vs_1_thread"], "")
+        other_budget = copy.deepcopy(baseline)
+        for sample in other_budget["runner_result"]["samples"]:
+            sample["operations"] = 4
+        self.assertEqual(scaling_summaries([parallel, other_budget])[0]["speedup_vs_1_thread"], "")
+
+    def test_reports_keep_worker_evidence_and_label_serial_latency(self) -> None:
+        result = {"implementation_id": "index", "threads": 2, "status": "passed",
+                  "runner_result": parallel_runner_payload()}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write_reports(root, {"threads": [2]}, {}, {}, [result])
+            report = json.loads((root / "report.json").read_text())
+            self.assertEqual(report["schema"], "string-index-benchmark-report/v2")
+            self.assertEqual(report["scaling"][0]["speedup_vs_1_thread"], "")
+            with (root / "workers.csv").open(newline="") as stream:
+                workers = list(csv.DictReader(stream))
+            self.assertEqual(len(workers), 4)
+            self.assertEqual([int(w["operations"]) for w in workers], [2, 1, 2, 1])
+            self.assertIn("独立单线程 P99", (root / "report.md").read_text())
 
 
 class ReaderTests(unittest.TestCase):
@@ -566,6 +754,31 @@ class SkewWorkloadTests(unittest.TestCase):
 
 
 class AdapterAndReportingTests(unittest.TestCase):
+    def test_source_git_identity_records_clean_and_modified_tracked_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            source = root / "model.h"
+            source.write_text("original\n")
+            subprocess.run(["git", "-C", str(root), "add", "model.h"], check=True)
+            subprocess.run(["git", "-c", "user.name=Benchmark Test", "-c", "user.email=test@example.invalid",
+                            "-c", "commit.gpgsign=false", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+            clean = _source_git_identity(root)
+            self.assertRegex(clean["commit"], r"^[0-9a-f]{40,64}$")
+            self.assertIs(clean["tracked_dirty"], False)
+            (root / "untracked").write_text("not included\n")
+            self.assertIs(_source_git_identity(root)["tracked_dirty"], False)
+            source.write_text("modified\n")
+            dirty = _source_git_identity(root)
+            self.assertEqual(dirty["commit"], clean["commit"])
+            self.assertIs(dirty["tracked_dirty"], True)
+
+    def test_source_git_identity_is_explicitly_unavailable_without_git(self) -> None:
+        with mock.patch("benchmark_lib.adapters.shutil.which", return_value=None):
+            identity = _source_git_identity(Path("missing"))
+        self.assertIsNone(identity["commit"])
+        self.assertIsNone(identity["tracked_dirty"])
+
     def test_manifest_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             manifest_path = make_manifest(Path(temp) / "adapter")
@@ -723,7 +936,7 @@ class AdapterAndReportingTests(unittest.TestCase):
             with mock.patch.object(benchmark, "build_runner", side_effect=BuildFailure("timeout")):
                 result = benchmark._run_implementation(
                     manifest, 1, root / "out-a", root / "r", root / "q", 1, 1, 1, 1, 1
-                )
+                )[0]
             self.assertEqual((result["status"], result["stage"]), ("failed", "build"))
 
             executable = root / "runner"
@@ -734,7 +947,7 @@ class AdapterAndReportingTests(unittest.TestCase):
             ):
                 result = benchmark._run_implementation(
                     manifest, 1, root / "out-b", root / "r", root / "q", 1, 1, 1, 1, 1
-                )
+                )[0]
             self.assertEqual((result["status"], result["stage"]), ("failed", "run"))
             self.assertEqual(result["build_identity"], identity)
 
@@ -745,7 +958,7 @@ class AdapterAndReportingTests(unittest.TestCase):
             ), mock.patch.object(benchmark, "invoke_runner", return_value=structured):
                 result = benchmark._run_implementation(
                     manifest, 1, root / "out-c", root / "r", root / "q", 1, 1, 1, 1, 1
-                )
+                )[0]
             self.assertEqual(
                 (result["status"], result["stage"], result["reason"]),
                 ("invalid_input", "interchange", "safe structured failure"),

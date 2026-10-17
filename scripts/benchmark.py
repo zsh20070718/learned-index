@@ -42,10 +42,17 @@ def _jobs(value: str) -> int:
     return parsed
 
 
+def _threads(value: str) -> int:
+    parsed = _positive_integer(value)
+    if parsed > 256:
+        raise argparse.ArgumentTypeError("must be between 1 and 256")
+    return parsed
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description=(
-            "Run the first-slice single-threaded static point-lookup benchmark. "
+            "Run static point lookups with serial or shared-index parallel reads. "
             "Implemented readers: raw-lines, JSONL string field, and strict legacy TLI."
         ),
         epilog=(
@@ -105,6 +112,17 @@ def parser() -> argparse.ArgumentParser:
         type=_jobs,
         default=2,
         help="conservative CMake build parallelism, 1-4 (default: 2)",
+    )
+    result.add_argument(
+        "--threads",
+        type=_threads,
+        nargs="+",
+        default=[1],
+        metavar="N",
+        help=(
+            "query worker counts, e.g. --threads 1 2 4; sorted, no duplicates, "
+            "1-256 (default: 1). Fixed total queries; distinct runs execute sequentially."
+        ),
     )
     result.add_argument(
         "--memory-budget-mib",
@@ -210,6 +228,9 @@ def _config_metadata(args: argparse.Namespace, output: Path) -> Dict[str, Any]:
         "build_timeout_seconds": args.build_timeout_seconds,
         "run_timeout_seconds": args.run_timeout_seconds,
         "jobs": args.jobs,
+        "threads": args.threads,
+        "operation_budget": "fixed total operations across workers",
+        "implementation_execution": "sequential; one build per adapter",
         "memory_budget_mib": args.memory_budget_mib,
         "network_downloads": "not performed by the benchmark",
     }
@@ -325,7 +346,14 @@ def _run_implementation(
     build_timeout: int,
     run_timeout: int,
     jobs: int,
-) -> Dict[str, Any]:
+    threads: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
+    thread_counts = threads if threads is not None else [1]
+
+    def statuses(status: str, stage: str, reason: str, identity: Any) -> List[Dict[str, Any]]:
+        return [dict(_status_result(manifest, status, stage, reason, identity), threads=n)
+                for n in thread_counts]
+
     build_root = output / "builds" / "{:03d}-{}".format(ordinal, manifest.adapter_id)
     build_root.parent.mkdir(parents=True, exist_ok=True)
     build_root.mkdir(exist_ok=False)
@@ -334,39 +362,39 @@ def _run_implementation(
             manifest, ROOT, build_root, build_timeout, jobs
         )
     except BuildFailure as error:
-        return _status_result(
-            manifest, "failed", "build", str(error), error.build_identity
-        )
+        return statuses("failed", "build", str(error), error.build_identity)
 
-    run_root = output / "runs" / "{:03d}-{}".format(ordinal, manifest.adapter_id)
-    run_root.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        runner_result = invoke_runner(
-            executable,
-            rows_path,
-            queries_path,
-            run_root,
-            repeats,
-            latency_samples,
-            run_timeout,
+    results = []
+    for n in thread_counts:
+        run_root = output / "runs" / "{:03d}-{}-t{}".format(ordinal, manifest.adapter_id, n)
+        run_root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            runner_result = invoke_runner(
+                executable, rows_path, queries_path, run_root,
+                repeats, latency_samples, run_timeout, threads=n,
+            )
+        except RunFailure as error:
+            results.append(dict(_status_result(
+                manifest, "failed", "run", str(error), build_identity
+            ), threads=n))
+            continue
+        result = _status_result(
+            manifest, runner_result["status"],
+            runner_result.get("stage", "complete"), runner_result.get("reason", ""),
+            build_identity,
         )
-    except RunFailure as error:
-        return _status_result(
-            manifest, "failed", "run", str(error), build_identity
-        )
-    result = _status_result(
-        manifest,
-        runner_result["status"],
-        runner_result.get("stage", "complete"),
-        runner_result.get("reason", ""),
-        build_identity,
-    )
-    result["runner_result"] = runner_result
-    return result
+        result["threads"] = n
+        result["runner_result"] = runner_result
+        results.append(result)
+    return results
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = parser().parse_args(argv)
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    if len(set(args.threads)) != len(args.threads):
+        argument_parser.error("--threads must not contain duplicate counts")
+    args.threads = sorted(args.threads)
     output = args.output.resolve() if args.output else _default_output()
     if output.exists():
         print("error: output directory already exists; refusing to overwrite", file=sys.stderr)
@@ -453,7 +481,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
             )
             continue
-        results.append(
+        results.extend(
             _run_implementation(
                 manifest,
                 ordinal,
@@ -465,6 +493,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.build_timeout_seconds,
                 args.run_timeout_seconds,
                 args.jobs,
+                args.threads,
             )
         )
 

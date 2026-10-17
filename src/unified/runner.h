@@ -17,6 +17,13 @@ struct Query {
   v1::Value expected_value = 0;
 };
 
+struct WorkerSample {
+  std::size_t worker = 0;
+  std::size_t operations = 0;
+  std::uint64_t lookup_ns = 0;
+  std::uint64_t checksum = 0;
+};
+
 struct ThroughputSample {
   std::size_t repeat = 0;
   std::uint64_t build_ns = 0;
@@ -26,6 +33,7 @@ struct ThroughputSample {
   std::uint64_t lookup_ns = 0;
   std::size_t operations = 0;
   double throughput_ops_per_second = 0.0;
+  std::vector<WorkerSample> workers;
 };
 
 struct LatencySample {
@@ -44,6 +52,15 @@ struct ValidationEvidence {
   bool finite_domain_full = false;
   std::size_t rows_checked = 0;
   std::size_t queries_checked = 0;
+  bool concurrent_find_checked = false;
+  std::size_t concurrent_queries_checked = 0;
+};
+
+struct ExecutionMetadata {
+  std::size_t threads = 1;
+  std::string mode = "serial";
+  std::string partition = "contiguous-balanced";
+  std::string latency_mode = "separate-single-thread";
 };
 
 struct RunReport {
@@ -51,6 +68,7 @@ struct RunReport {
   std::string status = "failed";
   std::string stage = "initialization";
   std::string reason;
+  ExecutionMetadata execution;
   std::optional<v1::Descriptor> descriptor;
   ValidationEvidence validation;
   std::optional<v1::MemoryUsage> memory;
@@ -70,7 +88,8 @@ RunReport run_static_lookup(v1::Factory factory,
                             const std::vector<v1::Row>& rows,
                             const std::vector<Query>& queries,
                             std::size_t repeats,
-                            std::size_t latency_samples);
+                            std::size_t latency_samples,
+                            std::size_t threads = 1);
 
 void write_result_json(std::ostream& output, const RunReport& report);
 void write_samples_csv(std::ostream& output, const RunReport& report);

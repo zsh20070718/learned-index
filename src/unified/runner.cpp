@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
@@ -15,11 +16,13 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -189,7 +192,8 @@ bool same_capabilities(const v1::Capabilities& left,
          left.bulk_load == right.bulk_load && left.find == right.find &&
          left.insert == right.insert && left.update == right.update &&
          left.erase == right.erase && left.scan == right.scan &&
-         left.range_sum == right.range_sum;
+         left.range_sum == right.range_sum &&
+         left.concurrent_find == right.concurrent_find;
 }
 
 bool same_descriptor(const v1::Descriptor& left,
@@ -602,6 +606,151 @@ void consume(const std::optional<v1::Value>& value, std::uint64_t* checksum) {
                (*checksum >> 2U);
 }
 
+struct ParallelWorkerResult {
+  WorkerSample sample;
+  std::string error;
+};
+
+struct ParallelRunResult {
+  std::uint64_t lookup_ns = 0;
+  std::vector<WorkerSample> workers;
+};
+
+std::pair<std::size_t, std::size_t> balanced_partition(
+    std::size_t operations, std::size_t workers, std::size_t worker) {
+  const std::size_t quotient = operations / workers;
+  const std::size_t remainder = operations % workers;
+  const std::size_t begin =
+      worker * quotient + std::min(worker, remainder);
+  const std::size_t count = quotient + (worker < remainder ? 1 : 0);
+  return {begin, begin + count};
+}
+
+ParallelRunResult run_synchronized_workers(
+    const v1::Index& index, const std::vector<Query>& queries,
+    const Oracle* oracle, std::size_t worker_count,
+    const std::string& phase) {
+  struct Gate {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::size_t ready = 0;
+    std::size_t completed = 0;
+    bool released = false;
+    bool cancelled = false;
+  } gate;
+
+  std::vector<ParallelWorkerResult> results(worker_count);
+  std::vector<std::thread> workers;
+  workers.reserve(worker_count);
+  try {
+    for (std::size_t worker = 0; worker < worker_count; ++worker) {
+      const auto bounds =
+          balanced_partition(queries.size(), worker_count, worker);
+      results[worker].sample.worker = worker;
+      results[worker].sample.operations = bounds.second - bounds.first;
+      workers.emplace_back([&, worker, bounds] {
+        {
+          std::unique_lock<std::mutex> lock(gate.mutex);
+          ++gate.ready;
+          gate.condition.notify_all();
+          gate.condition.wait(
+              lock, [&] { return gate.released || gate.cancelled; });
+          if (gate.cancelled) {
+            return;
+          }
+        }
+
+        const auto worker_start = Clock::now();
+        std::uint64_t worker_checksum = 0;
+        for (std::size_t query_index = bounds.first;
+             query_index < bounds.second; ++query_index) {
+          std::optional<v1::Value> value;
+          try {
+            value = index.find(queries[query_index].key);
+          } catch (...) {
+            results[worker].error =
+                "adapter find call failed at " + phase + " worker " +
+                std::to_string(worker) + " index " +
+                std::to_string(query_index);
+            break;
+          }
+
+          if (oracle != nullptr) {
+            const auto expected = oracle->find(queries[query_index].key);
+            const bool expected_present = expected != oracle->end();
+            if (value.has_value() != expected_present) {
+              results[worker].error =
+                  phase + " worker " + std::to_string(worker) + " index " +
+                  std::to_string(query_index) +
+                  (expected_present ? " produced a false miss"
+                                    : " produced a false hit");
+              break;
+            }
+            if (expected_present && *value != expected->second) {
+              results[worker].error =
+                  phase + " worker " + std::to_string(worker) + " index " +
+                  std::to_string(query_index) + " returned the wrong value";
+              break;
+            }
+          }
+          consume(value, &worker_checksum);
+        }
+        const auto worker_end = Clock::now();
+        results[worker].sample.checksum = worker_checksum;
+        results[worker].sample.lookup_ns =
+            elapsed_ns(worker_start, worker_end);
+        {
+          std::lock_guard<std::mutex> lock(gate.mutex);
+          ++gate.completed;
+        }
+        gate.condition.notify_all();
+      });
+    }
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> lock(gate.mutex);
+      gate.cancelled = true;
+    }
+    gate.condition.notify_all();
+    for (auto& worker : workers) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+    throw std::runtime_error("worker launch failed at " + phase);
+  }
+
+  Clock::time_point lookup_start;
+  Clock::time_point lookup_end;
+  {
+    std::unique_lock<std::mutex> lock(gate.mutex);
+    gate.condition.wait(lock, [&] { return gate.ready == worker_count; });
+    lookup_start = Clock::now();
+    gate.released = true;
+    gate.condition.notify_all();
+    gate.condition.wait(lock,
+                        [&] { return gate.completed == worker_count; });
+    lookup_end = Clock::now();
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+
+  for (const auto& result : results) {
+    if (!result.error.empty()) {
+      throw std::runtime_error(result.error);
+    }
+  }
+
+  ParallelRunResult run;
+  run.lookup_ns = elapsed_ns(lookup_start, lookup_end);
+  run.workers.reserve(worker_count);
+  for (auto& result : results) {
+    run.workers.push_back(std::move(result.sample));
+  }
+  return run;
+}
+
 std::string json_escape(std::string_view value) {
   std::ostringstream output;
   output << '"';
@@ -803,8 +952,24 @@ RunReport run_static_lookup(v1::Factory factory,
                             const std::vector<v1::Row>& rows,
                             const std::vector<Query>& queries,
                             std::size_t repeats,
-                            std::size_t latency_sample_count) {
+                            std::size_t latency_sample_count,
+                            std::size_t threads) {
   RunReport report;
+  report.execution.threads = threads;
+  report.execution.mode =
+      threads == 1 ? "serial" : "shared-index-read-only";
+  if (threads == 0 || threads > 256) {
+    report.status = "invalid_input";
+    report.stage = "execution";
+    report.reason = "threads must be in the range 1..256";
+    return report;
+  }
+  if (!queries.empty() && threads > queries.size()) {
+    report.status = "invalid_input";
+    report.stage = "execution";
+    report.reason = "threads must not exceed the nonempty query count";
+    return report;
+  }
   if (repeats == 0) {
     report.stage = "configuration";
     report.reason = "repeats must be positive";
@@ -830,6 +995,14 @@ RunReport run_static_lookup(v1::Factory factory,
       return report;
     }
     report.validation.descriptor_checked = true;
+
+    if (threads > 1 && !descriptor.capabilities.concurrent_find) {
+      report.status = "unsupported";
+      report.stage = "capability";
+      report.reason =
+          "adapter does not declare shared-index concurrent find support";
+      return report;
+    }
 
     std::vector<std::string> unique_keys;
     if (auto error = validate_domain(descriptor.capabilities, rows, queries,
@@ -945,6 +1118,26 @@ RunReport run_static_lookup(v1::Factory factory,
       return report;
     }
 
+    if (threads > 1) {
+      auto concurrent_index =
+          make_index(factory, parameters, "concurrent correctness instance");
+      require_stable_descriptor(
+          descriptor,
+          adapter_call("descriptor", "concurrent correctness instance before build",
+                       [&] { return concurrent_index->descriptor(); }));
+      adapter_call("bulk_load", "concurrent correctness instance",
+                   [&] { concurrent_index->bulk_load(rows); });
+      require_stable_descriptor(
+          descriptor,
+          adapter_call("descriptor", "concurrent correctness instance after build",
+                       [&] { return concurrent_index->descriptor(); }));
+      (void)run_synchronized_workers(*concurrent_index, queries, &oracle,
+                                     threads, "concurrent correctness query");
+      report.validation.concurrent_find_checked = true;
+      report.validation.concurrent_queries_checked = queries.size();
+      concurrent_index.reset();
+    }
+
     report.samples.reserve(repeats);
     const std::size_t measured_latency_count =
         std::min(latency_sample_count, queries.size());
@@ -968,20 +1161,35 @@ RunReport run_static_lookup(v1::Factory factory,
                        "throughput repeat " + std::to_string(repeat),
                        [&] { return throughput_index->descriptor(); }));
 
-      const auto lookup_start = Clock::now();
-      for (std::size_t i = 0; i < queries.size(); ++i) {
-        consume(adapter_repeated_call(
-                    "find", "throughput query", repeat, i,
-                    [&] { return throughput_index->find(queries[i].key); }),
-                &report.checksum);
-      }
-      const auto lookup_end = Clock::now();
-
       ThroughputSample sample;
       sample.repeat = repeat;
       sample.build_ns = elapsed_ns(build_start, build_end);
-      sample.lookup_ns = elapsed_ns(lookup_start, lookup_end);
       sample.operations = queries.size();
+      if (threads == 1) {
+        WorkerSample worker;
+        worker.worker = 0;
+        worker.operations = queries.size();
+        const auto lookup_start = Clock::now();
+        for (std::size_t i = 0; i < queries.size(); ++i) {
+          consume(adapter_repeated_call(
+                      "find", "throughput query", repeat, i,
+                      [&] { return throughput_index->find(queries[i].key); }),
+                  &worker.checksum);
+        }
+        const auto lookup_end = Clock::now();
+        worker.lookup_ns = elapsed_ns(lookup_start, lookup_end);
+        sample.lookup_ns = worker.lookup_ns;
+        sample.workers.push_back(worker);
+      } else {
+        ParallelRunResult parallel = run_synchronized_workers(
+            *throughput_index, queries, nullptr, threads,
+            "throughput repeat " + std::to_string(repeat));
+        sample.lookup_ns = parallel.lookup_ns;
+        sample.workers = std::move(parallel.workers);
+      }
+      for (const auto& worker : sample.workers) {
+        consume(worker.checksum, &report.checksum);
+      }
       if (sample.lookup_ns == 0) {
         throw std::runtime_error(
             "throughput lookup duration is below clock resolution");
@@ -1058,10 +1266,15 @@ RunReport run_static_lookup(v1::Factory factory,
 
 void write_result_json(std::ostream& output, const RunReport& report) {
   output << "{\n"
-         << "  \"schema\": \"string-index-static-run/v1\",\n"
+         << "  \"schema\": \"string-index-static-run/v2\",\n"
          << "  \"status\": " << json_escape(report.status) << ",\n"
          << "  \"stage\": " << json_escape(report.stage) << ",\n"
          << "  \"reason\": " << json_escape(report.reason) << ",\n"
+         << "  \"execution\": {\"threads\": " << report.execution.threads
+         << ", \"mode\": " << json_escape(report.execution.mode)
+         << ", \"partition\": " << json_escape(report.execution.partition)
+         << ", \"latency_mode\": "
+         << json_escape(report.execution.latency_mode) << "},\n"
          << "  \"descriptor\": ";
   if (!report.descriptor) {
     output << "null";
@@ -1104,7 +1317,9 @@ void write_result_json(std::ostream& output, const RunReport& report) {
            << "      \"scan\": "
            << json_escape(support_name(capabilities.scan)) << ",\n"
            << "      \"range_sum\": "
-           << json_escape(support_name(capabilities.range_sum)) << "\n"
+           << json_escape(support_name(capabilities.range_sum)) << ",\n"
+           << "      \"concurrent_find\": "
+           << (capabilities.concurrent_find ? "true" : "false") << "\n"
            << "    }\n"
            << "  }";
   }
@@ -1125,6 +1340,10 @@ void write_result_json(std::ostream& output, const RunReport& report) {
          << (report.validation.finite_domain_full ? "true" : "false")
          << ", \"rows_checked\": " << report.validation.rows_checked
          << ", \"queries_checked\": " << report.validation.queries_checked
+         << ", \"concurrent_find_checked\": "
+         << (report.validation.concurrent_find_checked ? "true" : "false")
+         << ", \"concurrent_queries_checked\": "
+         << report.validation.concurrent_queries_checked
          << "},\n"
          << "  \"memory\": ";
   if (!report.memory) {
@@ -1152,7 +1371,19 @@ void write_result_json(std::ostream& output, const RunReport& report) {
     output << ", \"lookup_ns\": " << sample.lookup_ns
            << ", \"operations\": " << sample.operations
            << ", \"throughput_ops_per_second\": " << std::setprecision(17)
-           << sample.throughput_ops_per_second << '}';
+           << sample.throughput_ops_per_second << ", \"workers\": [";
+    for (std::size_t worker_index = 0;
+         worker_index < sample.workers.size(); ++worker_index) {
+      if (worker_index != 0) {
+        output << ',';
+      }
+      const auto& worker = sample.workers[worker_index];
+      output << "{\"worker\": " << worker.worker
+             << ", \"operations\": " << worker.operations
+             << ", \"lookup_ns\": " << worker.lookup_ns
+             << ", \"checksum\": " << worker.checksum << '}';
+    }
+    output << "]}";
   }
   if (!report.samples.empty()) {
     output << '\n';
@@ -1204,7 +1435,8 @@ int run_cli(int argc, char** argv, v1::Factory factory) {
       const std::string option = argv[i];
       if (option != "--rows" && option != "--queries" &&
           option != "--result" && option != "--samples" &&
-          option != "--repeats" && option != "--latency-samples") {
+          option != "--repeats" && option != "--latency-samples" &&
+          option != "--threads") {
         throw std::invalid_argument("unknown option: " + option);
       }
       if (i + 1 >= argc) {
@@ -1228,13 +1460,23 @@ int run_cli(int argc, char** argv, v1::Factory factory) {
         parse_count(options.at("--repeats"), "--repeats", false);
     const std::size_t latency_samples = parse_count(
         options.at("--latency-samples"), "--latency-samples", true);
+    const std::size_t threads =
+        options.find("--threads") == options.end()
+            ? 1
+            : parse_count(options.at("--threads"), "--threads", false);
+    if (threads > 256) {
+      throw std::invalid_argument("--threads must be in the range 1..256");
+    }
     preflight_cli_paths(options);
     RunReport report;
+    report.execution.threads = threads;
+    report.execution.mode =
+        threads == 1 ? "serial" : "shared-index-read-only";
     try {
       const auto rows = read_rows_file(options.at("--rows"));
       const auto queries = read_queries_file(options.at("--queries"));
       report = run_static_lookup(factory, {}, rows, queries, repeats,
-                                 latency_samples);
+                                 latency_samples, threads);
     } catch (const std::exception& error) {
       report.status = "invalid_input";
       report.stage = "interchange";

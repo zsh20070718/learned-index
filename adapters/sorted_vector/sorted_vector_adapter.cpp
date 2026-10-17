@@ -43,6 +43,7 @@ class SortedVectorIndex final : public string_index_bench::v1::Index {
     descriptor.capabilities.bulk_load =
         string_index_bench::v1::Support::native;
     descriptor.capabilities.find = string_index_bench::v1::Support::native;
+    descriptor.capabilities.concurrent_find = true;
     return descriptor;
   }
 

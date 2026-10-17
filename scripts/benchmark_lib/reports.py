@@ -3,6 +3,7 @@
 import csv
 import json
 import math
+import os
 import platform
 import statistics
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 SUMMARY_FIELDS = [
     "implementation_id",
+    "threads",
     "status",
     "stage",
     "reason",
@@ -28,6 +30,8 @@ SUMMARY_FIELDS = [
     "median_build_ns",
     "median_lookup_ns",
     "median_throughput_ops_per_second",
+    "speedup_vs_1_thread",
+    "parallel_efficiency",
     "min_throughput_ops_per_second",
     "max_throughput_ops_per_second",
     "stdev_throughput_ops_per_second",
@@ -41,6 +45,7 @@ SUMMARY_FIELDS = [
 
 SAMPLE_FIELDS = [
     "implementation_id",
+    "threads",
     "status",
     "stage",
     "sample_type",
@@ -54,18 +59,45 @@ SAMPLE_FIELDS = [
     "latency_ns",
 ]
 
+WORKER_FIELDS = [
+    "implementation_id", "threads", "repeat", "worker", "operations",
+    "lookup_ns", "checksum",
+]
+
+SCALING_FIELDS = [
+    "implementation_id", "threads", "status", "operations",
+    "median_throughput_ops_per_second", "speedup_vs_1_thread", "parallel_efficiency",
+]
+
 
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def environment_metadata() -> Dict[str, Any]:
+    try:
+        affinity = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        affinity = None
+    cpu_model = platform.processor() or None
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as stream:
+            for line in stream:
+                if line.startswith("model name"):
+                    cpu_model = line.partition(":")[2].strip()
+                    break
+    except OSError:
+        pass
     return {
         "platform": platform.platform(),
         "machine": platform.machine(),
         "python": platform.python_version(),
-        "cpu_count": __import__("os").cpu_count(),
-        "threading": "single-threaded benchmark runner",
+        "cpu_count": os.cpu_count(),
+        "cpu_model": cpu_model,
+        "cpu_affinity": affinity,
+        "available_cpu_count": len(affinity) if affinity is not None else os.cpu_count(),
+        "threading": "shared-index static reads; configurations run sequentially",
+        "cpu_pinning": "not performed; inherited process affinity",
     }
 
 
@@ -140,6 +172,7 @@ def summary_row(result: Dict[str, Any]) -> Dict[str, Any]:
         configuration = {}
     return {
         "implementation_id": result.get("implementation_id", ""),
+        "threads": result.get("threads", 1),
         "status": status,
         "stage": result.get("stage", ""),
         "reason": result.get("reason", ""),
@@ -166,6 +199,8 @@ def summary_row(result: Dict[str, Any]) -> Dict[str, Any]:
             if measured
             else ""
         ),
+        "speedup_vs_1_thread": "",
+        "parallel_efficiency": "",
         "min_throughput_ops_per_second": _minimum(throughputs) if measured else "",
         "max_throughput_ops_per_second": _maximum(throughputs) if measured else "",
         "stdev_throughput_ops_per_second": _stdev(throughputs) if measured else "",
@@ -185,6 +220,7 @@ def summary_row(result: Dict[str, Any]) -> Dict[str, Any]:
 def sample_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     base = {
         "implementation_id": result.get("implementation_id", ""),
+        "threads": result.get("threads", 1),
         "status": result.get("status", "failed"),
         "stage": result.get("stage", ""),
     }
@@ -248,6 +284,26 @@ def _markdown_cell(value: Any) -> str:
     return str(value if value not in (None, "") else "不可用").replace("|", "\\|").replace("\n", " ")
 
 
+def scaling_summaries(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    summaries = [summary_row(result) for result in results]
+    baselines = {
+        row["implementation_id"]: row
+        for row in summaries if row["threads"] == 1 and row["status"] == "passed"
+    }
+    for row in summaries:
+        baseline = baselines.get(row["implementation_id"])
+        if row["status"] != "passed" or baseline is None:
+            continue
+        throughput = _number(row["median_throughput_ops_per_second"])
+        baseline_throughput = _number(baseline["median_throughput_ops_per_second"])
+        if (throughput is not None and baseline_throughput is not None
+                and baseline_throughput > 0 and row["operations"] == baseline["operations"]):
+            speedup = throughput / baseline_throughput
+            row["speedup_vs_1_thread"] = speedup
+            row["parallel_efficiency"] = speedup / row["threads"]
+    return summaries
+
+
 def write_reports(
     output: Path,
     config: Dict[str, Any],
@@ -255,18 +311,30 @@ def write_reports(
     workload: Dict[str, Any],
     results: List[Dict[str, Any]],
 ) -> None:
+    # Global preparation/build failures still have one row per requested pair.
+    results = [
+        dict(result, threads=threads)
+        for result in results
+        for threads in ([result["threads"]] if "threads" in result else config.get("threads", [1]))
+    ]
+    summaries = scaling_summaries(results)
+    scaling = [{field: row[field] for field in SCALING_FIELDS} for row in summaries]
     report = {
-        "schema": "string-index-benchmark-report/v1",
+        "schema": "string-index-benchmark-report/v2",
         "generated_at": utc_timestamp(),
-        "scope": "single-threaded static unique-key point lookup",
+        "scope": "static unique-key point lookup, serial and shared-index concurrent reads",
         "config": config,
         "dataset": dataset,
         "workload": workload,
         "environment": environment_metadata(),
         "results": results,
+        "scaling": scaling,
         "limitations": [
-            "Only bulk_load and find are accredited in this first slice.",
+            "Only bulk_load and find are accredited; concurrent writes are not measured.",
             "Latency includes timer overhead; the process is not CPU-pinned.",
+            "Latency is measured separately with one thread, not under parallel load.",
+            "Total queries are fixed across threads; no warmup, no thread creation in lookup timing.",
+            "Concurrent correctness checks do not prove absence of every possible data race.",
             "Memory fields retain the adapter's accounting scope and are not ranked.",
         ],
     }
@@ -275,7 +343,6 @@ def write_reports(
         encoding="utf-8",
     )
 
-    summaries = [summary_row(result) for result in results]
     with (output / "summary.csv").open("x", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=SUMMARY_FIELDS)
         writer.writeheader()
@@ -285,11 +352,25 @@ def write_reports(
         writer.writeheader()
         for result in results:
             writer.writerows(sample_rows(result))
+    with (output / "scaling.csv").open("x", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=SCALING_FIELDS)
+        writer.writeheader()
+        writer.writerows(scaling)
+    with (output / "workers.csv").open("x", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=WORKER_FIELDS)
+        writer.writeheader()
+        for result in results:
+            if result["status"] != "passed":
+                continue
+            for sample in (result.get("runner_result") or {}).get("samples", []):
+                for worker in sample.get("workers", []):
+                    writer.writerow(dict(worker, implementation_id=result["implementation_id"],
+                                         threads=result["threads"], repeat=sample["repeat"]))
 
     lines = [
         "# 字符串索引统一评测报告",
         "",
-        "本报告覆盖单线程、内存、唯一键 map 的静态点查询。首版只验收 `bulk_load` 和 `find`。",
+        "本报告覆盖内存、唯一键 map 的静态点查询，支持单线程和共享索引实例的并发只读查询。验收 `bulk_load` 和 `find`。",
         "",
         "## 数据与负载",
         "",
@@ -307,19 +388,23 @@ def write_reports(
             _markdown_cell(workload.get("repeats")),
         ),
         *_workload_lines(workload),
+        "- 查询线程数：{}；各配置依次运行，每个适配器仅编译一次。".format(
+            ", ".join(str(n) for n in config.get("threads", [1]))),
+        "- 每轮总请求数固定，连续均分给工作线程，不随线程数增加。",
         "",
         "## 实现结果",
         "",
-        "| 实现 ID | 状态 | 阶段 | 原因 | 构建中位数（ns） | 吞吐量中位数（ops/s） | 吞吐量范围（ops/s） | 吞吐量标准差 | P50 延迟（ns） | P99 延迟（ns） |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 实现 ID | 线程数 | 状态 | 阶段 | 原因 | 构建中位数（ns） | 吞吐量中位数（ops/s） | 吞吐量范围（ops/s） | 吞吐量标准差 | 独立单线程 P50（ns） | 独立单线程 P99（ns） |",
+        "| --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in summaries:
         lines.append(
-            "| {} | {} | {} | {} | {} | {} | {}–{} | {} | {} | {} |".format(
+            "| {} | {} | {} | {} | {} | {} | {} | {}–{} | {} | {} | {} |".format(
                 *(
                     _markdown_cell(row[name])
                     for name in (
                         "implementation_id",
+                        "threads",
                         "status",
                         "stage",
                         "reason",
@@ -334,12 +419,26 @@ def write_reports(
                 )
             )
         )
+    lines.extend([
+        "", "## 线程扩展性", "",
+        "加速比 = 当前吞吐量中位数 / 同一实现的单线程吞吐量中位数；并行效率 = 加速比 / 线程数。未请求单线程、单线程失败或总操作数不同时留空。", "",
+        "| 实现 ID | 线程数 | 状态 | 加速比 | 并行效率 |",
+        "| --- | ---: | --- | ---: | ---: |",
+    ])
+    for row in summaries:
+        lines.append("| {} | {} | {} | {} | {} |".format(*(
+            _markdown_cell(row[name]) for name in (
+                "implementation_id", "threads", "status", "speedup_vs_1_thread", "parallel_efficiency"
+            )
+        )))
     lines.extend(
         [
             "",
             "## 解读限制",
             "",
             "失败、跳过和不支持的实现保留在所有汇总文件中，性能列为空，不以零值代替。内存分项只有在适配器给出明确口径时才展示；本报告不据此生成内存排名。延迟包含计时器开销，进程未绑核，小规模结果不用于论文级排名。",
+            "并行吞吐量计时从所有工作线程就绪后的统一释放开始，到全部完成为止；不含创建/回收线程及构建，包含调度和同步开销。延迟来自另建索引的独立单线程抽样，不是并发负载下的尾延迟；默认不预热。并发校验通过只说明本次工作负载通过，不证明实现没有数据竞争。",
+            "`workers.csv` 保留每轮各线程的操作数、耗时与校验和；`scaling.csv` 可直接绘制扩展性曲线。运行环境和继承的 CPU 亲和性见 `report.json`。",
             "",
         ]
     )

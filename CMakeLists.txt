@@ -3,6 +3,7 @@ project(string_index_benchmark LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+find_package(Threads REQUIRED)
 
 option(BUILD_LEGACY_BENCHMARK "Build the existing TLI-based benchmark and checks" ON)
 
@@ -16,8 +17,6 @@ if(BUILD_LEGACY_BENCHMARK)
   if(NOT BOOST_HEADERS)
     message(FATAL_ERROR "Missing Boost headers. Run: python3 scripts/setup.py")
   endif()
-  find_package(Threads REQUIRED)
-
   # Build only the string setup entrypoint; keep upstream's full build untouched.
   add_executable(string_benchmark src/string_benchmark.cpp)
   add_executable(generate "${TLI_ROOT}/generate.cc")
@@ -45,6 +44,7 @@ target_include_directories(unified_runner_test PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src/unified"
   "${CMAKE_CURRENT_SOURCE_DIR}/adapters/std_map"
   "${CMAKE_CURRENT_SOURCE_DIR}/adapters/sorted_vector")
+target_link_libraries(unified_runner_test PRIVATE Threads::Threads)
 add_test(NAME unified_runner_checks COMMAND unified_runner_test)
 set_tests_properties(unified_runner_checks PROPERTIES TIMEOUT 30)
 
